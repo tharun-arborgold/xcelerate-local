@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Xcelerate Dev Launcher</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <header>
+    <span class="app-title">⚡ Xcelerate Dev</span>
+    <div class="slot-tabs" id="slot-tabs"></div>
+    <div class="hdr-right">
+      <span class="last-updated" id="last-updated">Loading…</span>
+    </div>
+  </header>
+
+  <main>
+    <div id="infra-section"></div>
+    <div id="docker-section"></div>
+    <div id="frontend-section"></div>
+    <div id="links-section"></div>
+  </main>
+
+  <div class="toast" id="toast"></div>
+
+  <div class="log-drawer" id="log-drawer">
+    <div class="log-hdr">
+      <span class="log-hdr-title" id="log-title">Logs</span>
+      <div class="log-hdr-btns">
+        <button class="btn btn-ghost" style="font-size:11px;padding:2px 8px" onclick="refreshLogs()">↻</button>
+        <button class="btn-icon" id="log-close">✕</button>
+      </div>
+    </div>
+    <pre class="log-body" id="log-body"></pre>
+  </div>
+
+  <script src="dist/app.js"></script>
+</body>
+</html>

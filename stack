@@ -282,19 +282,26 @@ case "$CMD" in
       echo "Usage: ./stack up <slot> <profile...>"
       echo ""
       echo "Profiles: contractor  corporate  xipp  qbo  forms  integrations  all"
+      echo "          backends    — start only backend services (no frontend containers)"
       echo ""
       echo "Examples:"
       echo "  ./stack up ${SLOT_NAME} contractor"
       echo "  ./stack up ${SLOT_NAME} contractor corporate"
+      echo "  ./stack up ${SLOT_NAME} backends        # for ng serve frontend dev"
       echo "  ./stack up ${SLOT_NAME} all"
       exit 1
     fi
 
-    PROFILE_FLAGS=$(resolve_profiles "${PROFILES[@]}")
-
-    echo "Starting '${STACK_NAME}' with profiles: ${PROFILES[*]}"
-    # shellcheck disable=SC2086
-    compose_cmd $PROFILE_FLAGS up --build -d
+    # 'backends' shorthand — start only backend services by name (no frontend containers)
+    if [[ "${PROFILES[*]}" == "backends" ]]; then
+      echo "Starting '${STACK_NAME}' backends only (use 'ng serve' for frontends)"
+      compose_cmd up --build -d rabbitmq contractor-backend corporate-backend
+    else
+      PROFILE_FLAGS=$(resolve_profiles "${PROFILES[@]}")
+      echo "Starting '${STACK_NAME}' with profiles: ${PROFILES[*]}"
+      # shellcheck disable=SC2086
+      compose_cmd $PROFILE_FLAGS up --build -d
+    fi
     echo ""
     echo "Running services:"
     compose_cmd ps --format "table {{.Service}}\t{{.Status}}" 2>/dev/null || true
@@ -305,7 +312,7 @@ case "$CMD" in
   down)
     SLOT_NAME="${2:?Usage: ./stack down <slot>}"
     load_slot "$SLOT_NAME"
-    compose_cmd down
+    compose_cmd down --remove-orphans
     ;;
 
   logs)
