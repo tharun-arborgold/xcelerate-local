@@ -15,7 +15,8 @@ ENV BUILD_CONFIG=${BUILD_CONFIG}
 
 WORKDIR /app
 
-RUN apk add --no-cache python3 make g++
+RUN apk add --no-cache python3 make g++ git && \
+    git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
 ENV NODE_OPTIONS=--max-old-space-size=4096
 
 COPY ${SRC_DIR}/package.json ${SRC_DIR}/package-lock.json ./
