@@ -155,6 +155,319 @@ BEGIN
 END
 GO
 
+-- ─────────────────────────────────────────
+-- Franchisor company  (corporate frontend login)
+-- loginValidateWithClientUrl → WHERE rest_comp_url LIKE '%http://localhost:4300/%'
+-- schema_name='tenant2' → corporate backend routes to tenant2 schema (separate from contractor tenant1)
+-- rest_comp_type='Franchisor' → corporate portal distinction
+-- ─────────────────────────────────────────
+IF NOT EXISTS (SELECT 1 FROM common.rest_comp_details WHERE rest_comp_id = 2)
+BEGIN
+    SET IDENTITY_INSERT common.rest_comp_details ON;
+    INSERT INTO common.rest_comp_details (
+        rest_comp_id,
+        rest_comp_hashcode,
+        rest_comp_code,
+        rest_comp_name,
+        rest_comp_short_name,
+        rest_comp_address,
+        rest_comp_phone_number1,
+        rest_comp_email,
+        rest_comp_status,
+        rest_comp_type,
+        rest_comp_url,
+        schema_name,
+        rest_comp_max_users,
+        source,
+        time_zone,
+        google_integration,
+        outlook_integration,
+        okta_integration,
+        is_analytics_enabled,
+        is_chat_enable,
+        rest_comp_logo,
+        rest_comp_plan_id
+    ) VALUES (
+        2,
+        'CORP001',
+        'CORP001',
+        'Xcelerate Corporate',
+        'Corporate',
+        '1250 Commerce Drive, Atlanta, GA 30301',
+        '4045550100',
+        'corp@xcelerate.com',
+        'Active',
+        'Franchisor',
+        'http://localhost:4300/',   -- must match dataUrl in environment.local.ts
+        'tenant2',                  -- franchisor has own schema, separate from contractor tenant1
+        100,
+        'System',
+        'US/Eastern',
+        'No',
+        'No',
+        'No',
+        0,
+        0,
+        0,
+        0
+    );
+    SET IDENTITY_INSERT common.rest_comp_details OFF;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM common.rest_comp_integrations WHERE rest_comp_id = 2)
+BEGIN
+    INSERT INTO common.rest_comp_integrations (rest_comp_id, status, source, created_by)
+    VALUES (2, 'Active', 'System', 0);
+END
+GO
+
+-- ─────────────────────────────────────────
+-- Corporate admin user  (common.user_user_details)
+-- ─────────────────────────────────────────
+IF NOT EXISTS (SELECT 1 FROM common.user_user_details WHERE user_detail_id = 2)
+BEGIN
+    SET IDENTITY_INSERT common.user_user_details ON;
+    INSERT INTO common.user_user_details (
+        user_detail_id,
+        user_id,
+        user_name,
+        first_name,
+        last_name,
+        email_id,
+        status,
+        source,
+        is_analytics_enabled,
+        created_by
+    ) VALUES (
+        2, 2,
+        'admin',
+        'Corporate', 'Admin',
+        'corp@xcelerate.com',
+        'Active', 'System',
+        0, 0
+    );
+    SET IDENTITY_INSERT common.user_user_details OFF;
+END
+GO
+
+-- ─────────────────────────────────────────
+-- Corporate admin credentials  (password: admin123)
+-- restoration_company_id=2 → franchisor company
+-- ─────────────────────────────────────────
+IF NOT EXISTS (SELECT 1 FROM common.user_user_authentication WHERE user_authentication_id = 2)
+BEGIN
+    SET IDENTITY_INSERT common.user_user_authentication ON;
+    INSERT INTO common.user_user_authentication (
+        user_authentication_id,
+        user_id,
+        user_detail_id,
+        user_name,
+        password,
+        restoration_company_id,
+        source
+    ) VALUES (
+        2, 2, 2,
+        'admin',
+        '$2b$10$yMNEoWqPkFCHtnzOPEAaFusvGJgyCt5w1AoxikhTJrsILJqCMoSa2',
+        2,
+        'System'
+    );
+    SET IDENTITY_INSERT common.user_user_authentication OFF;
+END
+GO
+UPDATE common.user_user_authentication
+SET password = '$2b$10$yMNEoWqPkFCHtnzOPEAaFusvGJgyCt5w1AoxikhTJrsILJqCMoSa2'
+WHERE user_authentication_id = 2;
+GO
+-- Always keep schema_name in sync (idempotency fix if row already existed as 'common')
+UPDATE common.rest_comp_details SET schema_name = 'tenant2' WHERE rest_comp_id = 2;
+GO
+
+-- ─────────────────────────────────────────
+-- common.association  (franchisor ↔ contractor link)
+-- offoredAndActivatedDetails() → findByHostAndStatus(companyId, 'Active')
+-- host=2 (corporate franchisor), contractor=1 (Apex contractor)
+-- ─────────────────────────────────────────
+IF NOT EXISTS (SELECT 1 FROM common.association WHERE host = 2 AND contractor = 1)
+BEGIN
+    INSERT INTO common.association (host, contractor, persona_type, created_by, updated_by, created_datetime, status, source)
+    VALUES (2, 1, 'Franchisor', 0, 0, GETDATE(), 'Active', 'System');
+END
+GO
+
+-- ─────────────────────────────────────────
+-- Cross-schema permissions: tenant2 (corporate) needs SELECT on tenant1 schema
+-- Required for: franchisee_active_filetypes_count SP (dynamic SQL runs as tenant2 user)
+-- offoredAndActivatedDetails → EXEC franchisee_active_filetypes_count 'tenant1'
+-- ─────────────────────────────────────────
+IF NOT EXISTS (
+    SELECT 1 FROM sys.database_permissions p
+    JOIN sys.database_principals dp ON p.grantee_principal_id = dp.principal_id
+    JOIN sys.schemas s ON p.major_id = s.schema_id
+    WHERE dp.name = 'tenant2' AND s.name = 'tenant1' AND p.permission_name = 'SELECT' AND p.class = 3
+)
+BEGIN
+    GRANT SELECT ON SCHEMA::tenant1 TO tenant2;
+END
+GO
+
+-- ─────────────────────────────────────────
+-- tenant2.file_types — copy the 11 Active types from tenant1
+-- Corporate franchisor needs matching Active file types for offoredAndActivatedDetails
+-- franchisee_active_filetypes_count SP counts tenant1 Active types; tenant2 needs same set
+-- ─────────────────────────────────────────
+SET IDENTITY_INSERT tenant2.file_types ON;
+INSERT INTO tenant2.file_types (
+    file_type_id, file_type, suffix, file_type_order,
+    created_by, created_datetime, updated_by, updated_datetime,
+    status, source, budget_percentage, category_id, workflow_type, file_type_icon
+)
+SELECT
+    file_type_id, file_type, suffix, file_type_order,
+    created_by, created_datetime, updated_by, updated_datetime,
+    status, source, budget_percentage, category_id, workflow_type, file_type_icon
+FROM tenant1.file_types
+WHERE status = 'Active'
+  AND file_type_id NOT IN (SELECT file_type_id FROM tenant2.file_types);
+SET IDENTITY_INSERT tenant2.file_types OFF;
+GO
+
+-- ═══════════════════════════════════════════════════════════════
+-- TENANT2 SCHEMA — corporate franchisor tenant-side identity
+-- Separate schema from tenant1 (contractor). Same structure, different company.
+-- ═══════════════════════════════════════════════════════════════
+
+-- ─────────────────────────────────────────
+-- tenant2.user_user_details  (corporate admin, tenant side)
+-- getuserToken() → userRepository.findByUserId(userId) queries TenantContext schema
+-- ─────────────────────────────────────────
+IF NOT EXISTS (SELECT 1 FROM tenant2.user_user_details WHERE user_id = 2)
+BEGIN
+    SET IDENTITY_INSERT tenant2.user_user_details ON;
+    INSERT INTO tenant2.user_user_details (
+        user_id,
+        user_name,
+        first_name, last_name,
+        email_id,
+        status, source,
+        admin_access,
+        crm_access,
+        time_tracking_access,
+        launch_screen,
+        release_read_status,
+        created_by   -- primitive int in UserDetails.java — must not be null
+    ) VALUES (
+        2,
+        'admin',
+        'Corporate', 'Admin',
+        'corp@xcelerate.com',
+        'Active', 'System',
+        'Yes', 'Y', 'Yes',
+        'Dashboard',
+        'Yes',
+        0
+    );
+    SET IDENTITY_INSERT tenant2.user_user_details OFF;
+END
+GO
+-- Idempotency: if row already existed without created_by, fix it
+UPDATE tenant2.user_user_details SET created_by = 0 WHERE user_id = 2 AND created_by IS NULL;
+GO
+
+-- ─────────────────────────────────────────
+-- tenant2.user_user_roles  (role assignment)
+-- getuserToken() → userRolesRepository.findByUserIdAndStatus(userId, 'Active')
+-- preferred_location → token claim; must match a valid rest_comp_location_id
+-- ─────────────────────────────────────────
+IF NOT EXISTS (SELECT 1 FROM tenant2.user_user_roles WHERE user_id = 2)
+BEGIN
+    SET IDENTITY_INSERT tenant2.user_user_roles ON;
+    INSERT INTO tenant2.user_user_roles (
+        user_role_id,
+        user_id,
+        role_id,
+        locations,
+        preferred_location,
+        status, source
+    ) VALUES (
+        1, 2, 1,
+        '*',    -- ALL_LOCATIONS
+        '1',    -- preferred_location → rest_comp_location_id in tenant2
+        'Active', 'System'
+    );
+    SET IDENTITY_INSERT tenant2.user_user_roles OFF;
+END
+GO
+
+-- ─────────────────────────────────────────
+-- tenant2.rest_comp_details  (tenant-side company record for JWT claims)
+-- JwtTokenUtil.genarateToken() → restCompanySchemaRepository.findByRestCompId(companyId)
+-- ─────────────────────────────────────────
+IF NOT EXISTS (SELECT 1 FROM tenant2.rest_comp_details WHERE rest_comp_id = 2)
+BEGIN
+    INSERT INTO tenant2.rest_comp_details (
+        rest_comp_id,
+        rest_comp_hash_code,
+        rest_comp_code,
+        rest_comp_name,
+        rest_comp_short_name,
+        rest_comp_status,
+        source,
+        rest_comp_max_users,
+        rest_comp_plan_id
+    ) VALUES (
+        2,
+        'CORP001',
+        'CORP001',
+        'Xcelerate Corporate',
+        'Corporate',
+        'Active',
+        'System',
+        100, 0
+    );
+END
+GO
+UPDATE tenant2.rest_comp_details SET rest_comp_max_users = 100 WHERE rest_comp_id = 2 AND rest_comp_max_users IS NULL;
+GO
+UPDATE tenant2.rest_comp_details SET rest_comp_plan_id   = 0   WHERE rest_comp_id = 2 AND rest_comp_plan_id IS NULL;
+GO
+
+-- ─────────────────────────────────────────
+-- tenant2.rest_comp_location  (HQ location)
+-- locationRepository.findByLocationStatus('Active') → needed for user dashboard
+-- preferred_location in user_user_roles must match rest_comp_location_id here
+-- ─────────────────────────────────────────
+IF NOT EXISTS (SELECT 1 FROM tenant2.rest_comp_location WHERE rest_comp_location_id = 1)
+BEGIN
+    SET IDENTITY_INSERT tenant2.rest_comp_location ON;
+    INSERT INTO tenant2.rest_comp_location (
+        rest_comp_location_id,
+        rest_comp_id,
+        location_hash,
+        location_code,
+        location_desc,
+        location_address,
+        location_city,
+        location_state,
+        location_zip,
+        location_status,
+        source
+    ) VALUES (
+        1, 2,
+        'CLOC001',
+        'Corporate HQ',
+        'Corporate Headquarters',
+        '1250 Commerce Drive',
+        'Atlanta',
+        'GA',
+        '30301',
+        'Active', 'System'
+    );
+    SET IDENTITY_INSERT tenant2.rest_comp_location OFF;
+END
+GO
+
 -- ═══════════════════════════════════════════════════════════════
 -- TENANT1 SCHEMA — tenant-side user identity + company + location
 -- ═══════════════════════════════════════════════════════════════
@@ -478,5 +791,7 @@ WHERE NOT EXISTS (
 );
 GO
 
-PRINT 'seed-identity.sql complete. Login: admin / admin123 at http://localhost:4200';
+PRINT 'seed-identity.sql complete.';
+PRINT '  Contractor login:  admin / admin123  at http://localhost:4200/';
+PRINT '  Corporate login:   admin / admin123  at http://localhost:4300/';
 GO

@@ -214,7 +214,7 @@ services:
       dockerfile: ${STACK_ROOT}/docker/Dockerfile.corporate-frontend
       args:
         SRC_DIR: ${CORP_FRONTEND_SRC_DIR:-xcelerate-corporate-frontend}
-        BUILD_CONFIG: ${CORP_BUILD_CONFIG:-production}
+        BUILD_CONFIG: ${CORP_BUILD_CONFIG:-local}
     image: xcelerate/corporate-frontend:${STACK_NAME:-local}
     profiles: ["corporate"]
     ports:

@@ -2,7 +2,7 @@
 # Build context: ~/repo/xcelerate/  (workspace root)
 
 ARG SRC_DIR=xcelerate-corporate-frontend
-ARG BUILD_CONFIG=production
+ARG BUILD_CONFIG=local
 
 # ============================================
 # Stage 1: Build
@@ -24,8 +24,8 @@ RUN npm ci --legacy-peer-deps
 
 COPY ${SRC_DIR}/ .
 
-RUN npx ng build --configuration=${BUILD_CONFIG} --output-path=dist/corporate-web 2>/dev/null || \
-    npx ng build --prod --output-path=dist/corporate-web
+RUN echo '{"version":"local"}' > src/version.json
+RUN npx ng build --configuration=${BUILD_CONFIG} --output-path=dist/corporate-web
 
 # ============================================
 # Stage 2: Serve with nginx
