@@ -1,0 +1,33 @@
+# Dockerfile.xipp-backend (Spring Boot / Java 21)
+# Build context: ~/repo/xcelerate/  (workspace root)
+
+ARG SRC_DIR=xcelerate-invoice-payment-processor
+
+# ============================================
+# Stage 1: Build
+# ============================================
+FROM maven:3.9-eclipse-temurin-21 AS builder
+
+ARG SRC_DIR
+WORKDIR /app
+
+COPY ${SRC_DIR}/pom.xml .
+RUN --mount=type=cache,target=/root/.m2 mvn dependency:go-offline -B
+
+COPY ${SRC_DIR}/src src
+RUN --mount=type=cache,target=/root/.m2 mvn package -DskipTests -B
+
+# ============================================
+# Stage 2: Runtime
+# ============================================
+FROM eclipse-temurin:21-jre
+
+WORKDIR /app
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/*.jar app.jar
+
+ENV SPRING_PROFILES_ACTIVE=e2e
+EXPOSE 8080
+
+ENTRYPOINT ["java", "-jar", "app.jar"]

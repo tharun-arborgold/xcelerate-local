@@ -1,0 +1,96 @@
+# Dockerfile.contractor-frontend (Angular 14, Node 16)
+# Build context: ~/repo/xcelerate/  (workspace root)
+# SRC_DIR arg lets you point at any repo clone — default or feature branch clone
+# BUILD_CONFIG maps to Angular --configuration=<value>
+#   local  → environment.local.ts  (relative URLs, works with nginx proxy)
+
+ARG SRC_DIR=xcelerate-contractor-frontend
+ARG BUILD_CONFIG=local
+
+# ============================================
+# Stage 1: Build
+# ============================================
+FROM node:16-alpine AS builder
+
+ARG SRC_DIR
+ARG BUILD_CONFIG
+ENV BUILD_CONFIG=${BUILD_CONFIG}
+
+WORKDIR /app
+
+RUN apk add --no-cache python3 make g++
+ENV NODE_OPTIONS=--max-old-space-size=8192
+
+COPY ${SRC_DIR}/package.json ${SRC_DIR}/package-lock.json ${SRC_DIR}/.npmrc ./
+RUN npm ci --legacy-peer-deps
+
+COPY ${SRC_DIR}/ .
+
+RUN echo '{"version":"local"}' > src/version.json
+RUN node node_modules/@angular/cli/bin/ng.js build --configuration=${BUILD_CONFIG} --output-path=dist/xcelerate-web
+
+# ============================================
+# Stage 2: Serve with nginx
+# ============================================
+FROM nginx:1.25-alpine
+
+COPY --from=builder /app/dist/xcelerate-web /usr/share/nginx/html
+
+# Nginx config — inlined so no extra build context dir needed
+RUN cat > /etc/nginx/conf.d/default.conf << 'EOF'
+server {
+    listen 80;
+    server_name localhost;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/x-javascript;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Proxy API calls to contractor-backend (internal Docker network)
+    location /xcelerate/ {
+        proxy_pass         http://contractor-backend:8081/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+    }
+
+    # Proxy to XIPP frontend (optional — only starts with xipp profile)
+    # Using variable + Docker DNS resolver so nginx doesn't fail if xipp-frontend
+    # isn't running (resolver is Docker's embedded DNS at 127.0.0.11)
+    location /xipp/ {
+        resolver           127.0.0.11 valid=10s;
+        set $xipp_upstream http://xipp-frontend:3000;
+        proxy_pass         $xipp_upstream/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+
+    location ~* \.(js|css)$ {
+        expires -1;
+        add_header Cache-Control "no-cache";
+    }
+
+    location ~* \.(png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+        expires 7d;
+        add_header Cache-Control "public";
+    }
+}
+EOF
+
+EXPOSE 80
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD wget -qO- http://localhost/ || exit 1
+
+CMD ["nginx", "-g", "daemon off;"]

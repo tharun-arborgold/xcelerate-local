@@ -1,0 +1,157 @@
+# Shared infrastructure — start ONCE, all slots share it
+#
+# Usage:
+#   ./stack infra up      Start SQL Server, run init + flyway + seed
+#   ./stack infra down    Stop (data persists in xcel-sqlserver-data volume)
+#   ./stack infra reset   Wipe volume and re-seed from scratch
+#
+# SQL Server is reachable from any slot backend at: sqlserver:1433
+# Host access: localhost:1433  (sa / LocalDev#2024!)
+
+networks:
+  xcel-infra-net:
+    name: xcel-infra-net
+    driver: bridge
+
+volumes:
+  xcel-sqlserver-data:
+    name: xcel-sqlserver-data
+
+services:
+  # ─────────────────────────────────────────
+  # SQL Server (Azure SQL Edge — ARM64 native)
+  # ─────────────────────────────────────────
+  sqlserver:
+    image: mcr.microsoft.com/azure-sql-edge:latest
+    container_name: xcel-sqlserver
+    ports:
+      - "1433:1433"
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "LocalDev#2024!"
+      MSSQL_PID: "Developer"
+    volumes:
+      - xcel-sqlserver-data:/var/opt/mssql
+    networks:
+      - xcel-infra-net
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/1433' 2>/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # Step 1: Create XcelerateDB + schema users
+  # ─────────────────────────────────────────
+  sqlserver-init:
+    image: mcr.microsoft.com/mssql-tools
+    platform: linux/amd64
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    volumes:
+      - ${STACK_ROOT}/scripts:/scripts:ro
+    networks:
+      - xcel-infra-net
+    command: ["/opt/mssql-tools/bin/sqlcmd", "-S", "sqlserver", "-U", "sa", "-P", "LocalDev#2024!", "-i", "/scripts/init-database.sql", "-b"]
+    restart: "no"
+
+  # ─────────────────────────────────────────
+  # Step 2: Run Flyway migrations (main branch)
+  # ─────────────────────────────────────────
+  flyway-init:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.flyway
+      args:
+        DB_SRC_DIR: ${DB_SRC_DIR:-xcelerate-database-versioning}
+    image: xcelerate/flyway-init:shared
+    command: ["--skip-dbo"]
+    depends_on:
+      sqlserver-init:
+        condition: service_completed_successfully
+    networks:
+      - xcel-infra-net
+    restart: "no"
+
+  # ─────────────────────────────────────────
+  # Step 2b: Apply dbo stored procedures
+  # (subset only — V0.3 views require 149 tenants and can't run locally)
+  # ─────────────────────────────────────────
+  dbo-sp-init:
+    image: mcr.microsoft.com/mssql-tools
+    platform: linux/amd64
+    depends_on:
+      flyway-init:
+        condition: service_completed_successfully
+    volumes:
+      - ${WORKSPACE}/${DB_SRC_DIR:-xcelerate-database-versioning}/flyway/migrations/dbo:/dbo:ro
+      - ${STACK_ROOT}/scripts:/scripts:ro
+    networks:
+      - xcel-infra-net
+    command:
+      - /bin/bash
+      - -c
+      - |
+        echo "Applying all dbo stored procedures..."
+        /opt/mssql-tools/bin/sqlcmd -S sqlserver -U sa -P "LocalDev#2024!" -d XcelerateDB \
+          -i /scripts/all-sps-combined.sql -b &&
+        echo "[OK] All dbo stored procedures applied"
+    restart: "no"
+
+  # ─────────────────────────────────────────
+  # Step 3a: Template seed (Level 1 — provisioning defaults, same for all tenants)
+  #   Roles, divisions, 11 legacy job types. No company or user data.
+  # ─────────────────────────────────────────
+  sqlserver-seed-template:
+    image: mcr.microsoft.com/mssql-tools
+    platform: linux/amd64
+    depends_on:
+      dbo-sp-init:
+        condition: service_completed_successfully
+    volumes:
+      - ${STACK_ROOT}/scripts:/scripts:ro
+    networks:
+      - xcel-infra-net
+    command: ["/opt/mssql-tools/bin/sqlcmd", "-S", "sqlserver", "-U", "sa", "-P", "LocalDev#2024!", "-i", "/scripts/seed-template.sql", "-b"]
+    restart: "no"
+
+  # ─────────────────────────────────────────
+  # Step 3b: Customer seed (Level 2 — customer identity, makes login work)
+  #   Company details, admin user + credentials, location, screen permissions.
+  # ─────────────────────────────────────────
+  sqlserver-seed-identity:
+    image: mcr.microsoft.com/mssql-tools
+    platform: linux/amd64
+    depends_on:
+      sqlserver-seed-template:
+        condition: service_completed_successfully
+    volumes:
+      - ${STACK_ROOT}/scripts:/scripts:ro
+    networks:
+      - xcel-infra-net
+    command: ["/opt/mssql-tools/bin/sqlcmd", "-S", "sqlserver", "-U", "sa", "-P", "LocalDev#2024!", "-i", "/scripts/seed-identity.sql", "-b"]
+    restart: "no"
+
+  # ─────────────────────────────────────────
+  # Step 3c: Custom seed (Level 3 — simulated business data, optional)
+  #   Contacts, master jobs, files, opportunities, task templates.
+  #   Only runs when the 'custom' profile is requested:
+  #     ./stack infra up --custom
+  #     ./stack infra reset --custom
+  # ─────────────────────────────────────────
+  sqlserver-seed-demo:
+    image: mcr.microsoft.com/mssql-tools
+    platform: linux/amd64
+    profiles: ["custom"]
+    depends_on:
+      sqlserver-seed-identity:
+        condition: service_completed_successfully
+    volumes:
+      - ${STACK_ROOT}/scripts:/scripts:ro
+    networks:
+      - xcel-infra-net
+    command: ["/opt/mssql-tools/bin/sqlcmd", "-S", "sqlserver", "-U", "sa", "-P", "LocalDev#2024!", "-i", "/scripts/seed-demo.sql", "-b"]
+    restart: "no"

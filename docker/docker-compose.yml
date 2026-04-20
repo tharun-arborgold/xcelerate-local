@@ -1,0 +1,526 @@
+# Xcelerate Personal Local Stack — docker-compose.yml
+#
+# All ports and source dirs come from the slot env file.
+# Run via: ~/xcelerate-local/stack up <slot-name>
+#
+# Internal ports (inside Docker network) never change.
+# Only host-side ports are parameterized — so nginx proxies always work.
+
+services:
+  # ─────────────────────────────────────────
+  # Message Broker
+  # ─────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "${RABBITMQ_AMQP_PORT:-5672}:5672"
+      - "${RABBITMQ_MGMT_PORT:-15672}:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-guest}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # contractor-backend  (Spring Boot 3 / Java 21)
+  # ─────────────────────────────────────────
+  contractor-backend:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.contractor-backend
+      target: runtime
+      args:
+        SRC_DIR: ${CB_SRC_DIR:-xcelerate-contractor-backend}
+    image: xcelerate/contractor-backend:${STACK_NAME:-local}
+    profiles: ["contractor"]
+    ports:
+      - "${CB_PORT:-8081}:8081"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${CB_SPRING_PROFILE:-dev}
+      SPRING_DATASOURCE_URL: ${CB_DB_URL:-}
+      SPRING_DATASOURCE_USERNAME: ${CB_DB_USER:-}
+      SPRING_DATASOURCE_PASSWORD: ${CB_DB_PASS:-}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx512m -Xms256m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # qbo-integration  (Spring Boot 1.5 / Java 8)
+  # ─────────────────────────────────────────
+  qbo-integration:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.qbo-integration
+      target: runtime
+      args:
+        SRC_DIR: ${QBO_SRC_DIR:-xcelerate-qbo-integration}
+    image: xcelerate/qbo-integration:${STACK_NAME:-local}
+    profiles: ["qbo"]
+    ports:
+      - "${QBO_PORT:-8083}:8081"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${QBO_SPRING_PROFILE:-dev}
+      SPRING_DATASOURCE_URL: ${QBO_DB_URL:-}
+      SPRING_DATASOURCE_USERNAME: ${QBO_DB_USER:-}
+      SPRING_DATASOURCE_PASSWORD: ${QBO_DB_PASS:-}
+      SPRING_RABBITMQ_ADDRESSES: "rabbitmq:5672"
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx256m -Xms128m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # xipp-backend  (Spring Boot / Java 21)
+  # ─────────────────────────────────────────
+  xipp-backend:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.xipp-backend
+      args:
+        SRC_DIR: ${XIPP_BACKEND_SRC_DIR:-xcelerate-invoice-payment-processor}
+    image: xcelerate/xipp-backend:${STACK_NAME:-local}
+    profiles: ["xipp"]
+    ports:
+      - "${XIPP_BACKEND_PORT:-8080}:8080"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${XIPP_SPRING_PROFILE:-local}
+      DATABASE_URL: ${XIPP_DB_URL:-}
+      DATABASE_USERNAME: ${XIPP_DB_USER:-}
+      DATABASE_PASSWORD: ${XIPP_DB_PASS:-}
+      JWT_SECRET: ${XIPP_JWT_SECRET:-}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx512m -Xms256m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # xipp-frontend  (React/Vite + Node)
+  # ─────────────────────────────────────────
+  xipp-frontend:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.xipp-frontend
+      args:
+        SRC_DIR: ${XIPP_FRONTEND_SRC_DIR:-xcelerate-ipp-frontend-v1}
+    image: xcelerate/xipp-frontend:${STACK_NAME:-local}
+    profiles: ["xipp"]
+    ports:
+      - "${XIPP_FRONTEND_PORT:-3000}:3000"
+    environment:
+      VITE_BASE_URL: http://localhost:${XIPP_BACKEND_PORT:-8080}/api
+    depends_on:
+      xipp-backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # contractor-frontend  (Angular 14 + nginx)
+  # ─────────────────────────────────────────
+  contractor-frontend:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.contractor-frontend
+      args:
+        SRC_DIR: ${CF_SRC_DIR:-xcelerate-contractor-frontend}
+        BUILD_CONFIG: ${CF_BUILD_CONFIG:-docker}
+    image: xcelerate/contractor-frontend:${STACK_NAME:-local}
+    profiles: ["contractor"]
+    ports:
+      - "${CF_PORT:-4200}:80"
+    depends_on:
+      contractor-backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # corporate-backend  (Spring Boot 3 / Java 21)
+  # ─────────────────────────────────────────
+  corporate-backend:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.java21-service
+      target: runtime
+      args:
+        SRC_DIR: ${CORP_BACKEND_SRC_DIR:-xcelerate-corporate-backend}
+        EXPOSE_PORT: "8087"
+    image: xcelerate/corporate-backend:${STACK_NAME:-local}
+    profiles: ["corporate"]
+    ports:
+      - "${CORP_BACKEND_PORT:-8087}:8087"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${CORP_SPRING_PROFILE:-dev1}
+      SPRING_DATASOURCE_URL: ${CB_DB_URL:-}
+      SPRING_DATASOURCE_USERNAME: ${CB_DB_USER:-}
+      SPRING_DATASOURCE_PASSWORD: ${CB_DB_PASS:-}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx512m -Xms256m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # corporate-frontend  (Angular 8 + nginx)
+  # ─────────────────────────────────────────
+  corporate-frontend:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.corporate-frontend
+      args:
+        SRC_DIR: ${CORP_FRONTEND_SRC_DIR:-xcelerate-corporate-frontend}
+        BUILD_CONFIG: ${CORP_BUILD_CONFIG:-production}
+    image: xcelerate/corporate-frontend:${STACK_NAME:-local}
+    profiles: ["corporate"]
+    ports:
+      - "${CORP_FRONTEND_PORT:-4300}:80"
+    depends_on:
+      corporate-backend:
+        condition: service_started
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # integration-services  (Spring Boot 3 / Java 21)
+  # ─────────────────────────────────────────
+  integration-services:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.java21-service
+      target: runtime
+      args:
+        SRC_DIR: ${INTEG_SVC_SRC_DIR:-xcelerate-integration-services}
+        EXPOSE_PORT: "8091"
+    image: xcelerate/integration-services:${STACK_NAME:-local}
+    profiles: ["integrations"]
+    ports:
+      - "${INTEG_SVC_PORT:-8091}:8091"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${INTEG_SPRING_PROFILE:-dev}
+      SPRING_DATASOURCE_URL: ${CB_DB_URL:-}
+      SPRING_DATASOURCE_USERNAME: ${CB_DB_USER:-}
+      SPRING_DATASOURCE_PASSWORD: ${CB_DB_PASS:-}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx256m -Xms128m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # companycam-integration  (Spring Boot 1.x / Java 8)
+  # ─────────────────────────────────────────
+  companycam-integration:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.java8-service
+      target: runtime
+      args:
+        SRC_DIR: ${COMPANYCAM_SRC_DIR:-xcelerate-companycam-integration}
+        EXPOSE_PORT: "8090"
+    image: xcelerate/companycam-integration:${STACK_NAME:-local}
+    profiles: ["integrations"]
+    ports:
+      - "${COMPANYCAM_PORT:-8090}:8090"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${COMPANYCAM_SPRING_PROFILE:-dev}
+      SPRING_DATASOURCE_URL: ${CB_DB_URL:-}
+      SPRING_DATASOURCE_USERNAME: ${CB_DB_USER:-}
+      SPRING_DATASOURCE_PASSWORD: ${CB_DB_PASS:-}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx256m -Xms128m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # encircle-integration  (Spring Boot 3 / Java 21)
+  # ─────────────────────────────────────────
+  encircle-integration:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.java21-service
+      target: runtime
+      args:
+        SRC_DIR: ${ENCIRCLE_SRC_DIR:-xcelerate-encircle-integration}
+        EXPOSE_PORT: "8004"
+    image: xcelerate/encircle-integration:${STACK_NAME:-local}
+    profiles: ["integrations"]
+    ports:
+      - "${ENCIRCLE_PORT:-8004}:8004"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${ENCIRCLE_SPRING_PROFILE:-dev}
+      SPRING_DATASOURCE_URL: ${CB_DB_URL:-}
+      SPRING_DATASOURCE_USERNAME: ${CB_DB_USER:-}
+      SPRING_DATASOURCE_PASSWORD: ${CB_DB_PASS:-}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx256m -Xms128m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # google-integration  (Spring Boot 1.x / Java 8)
+  # ─────────────────────────────────────────
+  google-integration:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.java8-service
+      target: runtime
+      args:
+        SRC_DIR: ${GOOGLE_SRC_DIR:-xcelerate-google-integration}
+        EXPOSE_PORT: "8009"
+    image: xcelerate/google-integration:${STACK_NAME:-local}
+    profiles: ["integrations"]
+    ports:
+      - "${GOOGLE_PORT:-8009}:8009"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${GOOGLE_SPRING_PROFILE:-dev}
+      SPRING_DATASOURCE_URL: ${CB_DB_URL:-}
+      SPRING_DATASOURCE_USERNAME: ${CB_DB_USER:-}
+      SPRING_DATASOURCE_PASSWORD: ${CB_DB_PASS:-}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx256m -Xms128m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # outlook-integration  (Spring Boot 3 / Java 21)
+  # ─────────────────────────────────────────
+  outlook-integration:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.java21-service
+      target: runtime
+      args:
+        SRC_DIR: ${OUTLOOK_SRC_DIR:-xcelerate-outlook-integration}
+        EXPOSE_PORT: "8010"
+    image: xcelerate/outlook-integration:${STACK_NAME:-local}
+    profiles: ["integrations"]
+    ports:
+      - "${OUTLOOK_PORT}:8010"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${OUTLOOK_SPRING_PROFILE:-dev}
+      SPRING_DATASOURCE_URL: ${CB_DB_URL:-}
+      SPRING_DATASOURCE_USERNAME: ${CB_DB_USER:-}
+      SPRING_DATASOURCE_PASSWORD: ${CB_DB_PASS:-}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx256m -Xms128m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # verisk-integration  (Spring Boot 3 / Java 21)
+  # ─────────────────────────────────────────
+  verisk-integration:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.java21-service
+      target: runtime
+      args:
+        SRC_DIR: ${VERISK_SRC_DIR:-xcelerate-verisk-integration}
+        EXPOSE_PORT: "8007"
+    image: xcelerate/verisk-integration:${STACK_NAME:-local}
+    profiles: ["integrations"]
+    ports:
+      - "${VERISK_PORT}:8007"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${VERISK_SPRING_PROFILE:-dev}
+      SPRING_DATASOURCE_URL: ${CB_DB_URL:-}
+      SPRING_DATASOURCE_USERNAME: ${CB_DB_USER:-}
+      SPRING_DATASOURCE_PASSWORD: ${CB_DB_PASS:-}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx256m -Xms128m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # erp-integration  (Spring Boot 3 / Java 21)
+  # No server.port in properties — SERVER_PORT env var sets it to 8011
+  # ─────────────────────────────────────────
+  erp-integration:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.java21-service
+      target: runtime
+      args:
+        SRC_DIR: ${ERP_SRC_DIR:-xcelerate-erp-integration}
+        EXPOSE_PORT: "8011"
+    image: xcelerate/erp-integration:${STACK_NAME:-local}
+    profiles: ["integrations"]
+    ports:
+      - "${ERP_PORT}:8011"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${ERP_SPRING_PROFILE:-dev}
+      SERVER_PORT: "8011"
+      SPRING_DATASOURCE_URL: ${CB_DB_URL:-}
+      SPRING_DATASOURCE_USERNAME: ${CB_DB_USER:-}
+      SPRING_DATASOURCE_PASSWORD: ${CB_DB_PASS:-}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx256m -Xms128m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # netsuite-integration  (Spring Boot 3 / Java 21)
+  # No server.port in properties — SERVER_PORT env var sets it to 8012
+  # ─────────────────────────────────────────
+  netsuite-integration:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.java21-service
+      target: runtime
+      args:
+        SRC_DIR: ${NETSUITE_SRC_DIR:-xcelerate-netsuite-integration}
+        EXPOSE_PORT: "8012"
+    image: xcelerate/netsuite-integration:${STACK_NAME:-local}
+    profiles: ["integrations"]
+    ports:
+      - "${NETSUITE_PORT}:8012"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${NETSUITE_SPRING_PROFILE:-dev}
+      SERVER_PORT: "8012"
+      SPRING_DATASOURCE_URL: ${CB_DB_URL:-}
+      SPRING_DATASOURCE_USERNAME: ${CB_DB_USER:-}
+      SPRING_DATASOURCE_PASSWORD: ${CB_DB_PASS:-}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx256m -Xms128m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # site-provisioner  (Spring Boot 3 / Java 21)
+  # Default port from application.properties: ${SERVER_PORT:9090}
+  # ─────────────────────────────────────────
+  site-provisioner:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.java21-service
+      target: runtime
+      args:
+        SRC_DIR: ${SITE_PROVISIONER_SRC_DIR:-xcelerate-site-provisioner}
+        EXPOSE_PORT: "9090"
+    image: xcelerate/site-provisioner:${STACK_NAME:-local}
+    profiles: ["integrations"]
+    ports:
+      - "${SITE_PROVISIONER_PORT}:9090"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${SITE_PROVISIONER_SPRING_PROFILE:-dev}
+      SERVER_PORT: "9090"
+      SPRING_DATASOURCE_URL: ${CB_DB_URL:-}
+      SPRING_DATASOURCE_USERNAME: ${CB_DB_USER:-}
+      SPRING_DATASOURCE_PASSWORD: ${CB_DB_PASS:-}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx256m -Xms128m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # forms  (Angular 13 + nginx)
+  # ─────────────────────────────────────────
+  forms:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.forms-frontend
+      args:
+        SRC_DIR: ${FORMS_SRC_DIR:-xcelerate-forms}
+        BUILD_CONFIG: ${FORMS_BUILD_CONFIG:-development}
+    image: xcelerate/forms:${STACK_NAME:-local}
+    profiles: ["forms"]
+    ports:
+      - "${FORMS_PORT}:80"
+    restart: unless-stopped
+
+volumes:
+  rabbitmq-data:
+    name: "${STACK_NAME:-xcel-local}-rabbitmq-data"

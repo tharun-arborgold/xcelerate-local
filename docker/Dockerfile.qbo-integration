@@ -1,0 +1,36 @@
+# Dockerfile.qbo-integration (Spring Boot 1.5, Java 8)
+# Build context: ~/repo/xcelerate/  (workspace root)
+
+ARG SRC_DIR=xcelerate-qbo-integration
+
+# ============================================
+# Stage 1: Build
+# ============================================
+FROM maven:3.8-eclipse-temurin-8 AS builder
+
+ARG SRC_DIR
+WORKDIR /app
+
+COPY ${SRC_DIR}/pom.xml .
+RUN --mount=type=cache,target=/root/.m2 mvn dependency:go-offline -B
+
+COPY ${SRC_DIR}/src src
+RUN --mount=type=cache,target=/root/.m2 mvn package -Dmaven.test.skip=true -B
+
+# ============================================
+# Stage 2: Runtime
+# ============================================
+FROM eclipse-temurin:8-jre AS runtime
+
+WORKDIR /app
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/*.jar app.jar
+
+ENV SPRING_PROFILES_ACTIVE=docker
+EXPOSE 8081
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD curl -f http://localhost:8081/actuator/health || exit 1
+
+ENTRYPOINT ["sh", "-c", "java ${JAVA_OPTS} -jar /app/app.jar"]

@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# ~/xcelerate-local/stack — personal multi-feature stack manager
+#
+# Usage:
+#   ./stack infra up                   Start shared SQL Server (run once, all slots share it)
+#   ./stack infra up --custom          Start + also apply Level 3 business data seed
+#   ./stack infra down                 Stop shared SQL Server (data persists)
+#   ./stack infra reset                Wipe DB and re-seed (Levels 1 + 2)
+#   ./stack infra reset --custom       Wipe DB and re-seed (Levels 1 + 2 + 3)
+#   ./stack up   <slot> [profile...]   Start stack with selected profiles
+#   ./stack down <slot>                Stop and remove all containers in slot
+#   ./stack logs <slot> [service]      Follow logs (all or one service)
+#   ./stack ps   [slot]                Show running containers (slot or all)
+#   ./stack build <slot> [service]     Rebuild without restarting
+#   ./stack seed  <slot>               Re-apply Levels 1 + 2 to running DB
+#   ./stack seed  <slot> --custom      Re-apply Levels 1 + 2 + 3 to running DB
+#   ./stack ports <slot>               Print all port assignments
+#   ./stack ls                         List slots with port summary
+#
+# Seed levels:
+#   Level 1 (seed-template.sql) — Provisioning defaults: roles, divisions, 11 job types
+#                                  Same for every tenant. No company or user data.
+#   Level 2 (seed-identity.sql) — Customer identity: company, admin user + credentials,
+#                                  location, screen permissions. Makes login work.
+#   Level 3 (seed-demo.sql)   — Business data: contacts, master jobs, files,
+#                                  opportunities, task templates. Optional.
+#
+# Profiles (pass one or more, or 'all'):
+#   contractor    contractor-backend + contractor-frontend
+#   corporate     corporate-backend + corporate-frontend
+#   xipp          xipp-backend + xipp-frontend
+#   qbo           qbo-integration
+#   forms         forms frontend
+#   integrations  all integration services (companycam, encircle, google,
+#                 outlook, verisk, erp, netsuite, integration-services,
+#                 site-provisioner)
+#   all           every profile above
+#
+# Examples:
+#   ./stack up slot-a contractor
+#   ./stack up slot-a contractor corporate
+#   ./stack up slot-a contractor integrations
+#   ./stack up slot-a all
+#   ./stack build slot-a contractor-frontend
+#   ./stack logs slot-a contractor-backend
+
+set -euo pipefail
+
+STACK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export STACK_ROOT
+
+CMD="${1:-}"
+
+ALL_PROFILES=(contractor corporate xipp qbo forms integrations)
+
+# ─── Port registry ─────────────────────────────────────────────────────────────
+# To add a new backend service: add one export line here with the next offset.
+# To add a new frontend: add one export with its own base port.
+# All slots get the new service automatically — no env file changes needed.
+#
+# Backend block: 8080 + (SLOT_INDEX * 100) + OFFSET
+#   0  contractor-backend
+#   1  corporate-backend
+#   2  xipp-backend
+#   3  qbo-integration
+#   4  integration-services
+#   5  companycam-integration
+#   6  encircle-integration
+#   7  google-integration
+#   8  outlook-integration
+#   9  verisk-integration
+#   10 erp-integration
+#   11 netsuite-integration
+#   12 site-provisioner
+#   13-99 reserved for future services
+
+compute_ports() {
+  local idx=${SLOT_INDEX:-0}
+  local base=$((8080 + idx * 100))
+
+  export CB_PORT=$((base + 0))
+  export CORP_BACKEND_PORT=$((base + 1))
+  export XIPP_BACKEND_PORT=$((base + 2))
+  export QBO_PORT=$((base + 3))
+  export INTEG_SVC_PORT=$((base + 4))
+  export COMPANYCAM_PORT=$((base + 5))
+  export ENCIRCLE_PORT=$((base + 6))
+  export GOOGLE_PORT=$((base + 7))
+  export OUTLOOK_PORT=$((base + 8))
+  export VERISK_PORT=$((base + 9))
+  export ERP_PORT=$((base + 10))
+  export NETSUITE_PORT=$((base + 11))
+  export SITE_PROVISIONER_PORT=$((base + 12))
+
+  export CF_PORT=$((4200 + idx))
+  export CORP_FRONTEND_PORT=$((4300 + idx))
+  export XIPP_FRONTEND_PORT=$((3000 + idx))
+  export FORMS_PORT=$((4400 + idx))
+
+  export RABBITMQ_AMQP_PORT=$((5672 + idx))
+  export RABBITMQ_MGMT_PORT=$((15672 + idx))
+  # SQL Server is shared infra — fixed port 1433, not per-slot
+}
+
+# ─── helpers ──────────────────────────────────────────────────────────────────
+
+usage() {
+  grep '^#' "$0" | head -30 | sed 's/^# \?//'
+  exit 1
+}
+
+load_slot() {
+  local name="$1"
+  local env_file="$STACK_ROOT/envs/${name}.env"
+  if [[ ! -f "$env_file" ]]; then
+    echo "Error: slot '$name' not found at $env_file"
+    echo ""
+    list_slots
+    exit 1
+  fi
+  set -a; source "$env_file"; set +a
+  export STACK_ROOT
+  compute_ports
+}
+
+list_slots() {
+  echo "Shared infrastructure:"
+  local sql_status; sql_status=$(docker inspect -f '{{.State.Status}}' xcel-sqlserver 2>/dev/null || echo "not started")
+  printf "  %-12s SQL Server :1433  [status: %s]  — './stack infra up' to start\n" "" "$sql_status"
+  echo ""
+  echo "Available slots:"
+  for f in "$STACK_ROOT/envs/"*.env; do
+    local name; name="$(basename "$f" .env)"
+    local idx; idx="$(grep '^SLOT_INDEX=' "$f" | cut -d= -f2)"
+    local cb_src; cb_src="$(grep '^CB_SRC_DIR=' "$f" | cut -d= -f2)"
+    local cf_port; cf_port=$((4200 + idx))
+    local cb_port; cb_port=$((8080 + idx * 100))
+    printf "  %-12s [index %s]  app: http://localhost:%-5s  api: :%s  src: %s\n" \
+      "$name" "$idx" "$cf_port" "$cb_port" "$cb_src"
+  done
+}
+
+print_ports() {
+  local idx=${SLOT_INDEX:-0}
+  echo "Port assignments for '${STACK_NAME}' (SLOT_INDEX=${idx}):"
+  echo ""
+  echo "  Frontends:"
+  printf "    %-30s %s\n" "contractor-frontend"   "http://localhost:${CF_PORT}   [profile: contractor]"
+  printf "    %-30s %s\n" "corporate-frontend"    "http://localhost:${CORP_FRONTEND_PORT}   [profile: corporate]"
+  printf "    %-30s %s\n" "xipp-frontend"         "http://localhost:${XIPP_FRONTEND_PORT}   [profile: xipp]"
+  printf "    %-30s %s\n" "forms"                 "http://localhost:${FORMS_PORT}   [profile: forms]"
+  echo ""
+  echo "  Backends:"
+  printf "    %-30s %s\n" "contractor-backend"    ":${CB_PORT}   [profile: contractor]"
+  printf "    %-30s %s\n" "corporate-backend"     ":${CORP_BACKEND_PORT}   [profile: corporate]"
+  printf "    %-30s %s\n" "xipp-backend"          ":${XIPP_BACKEND_PORT}   [profile: xipp]"
+  printf "    %-30s %s\n" "qbo-integration"       ":${QBO_PORT}   [profile: qbo]"
+  printf "    %-30s %s\n" "integration-services"  ":${INTEG_SVC_PORT}   [profile: integrations]"
+  printf "    %-30s %s\n" "companycam-integration" ":${COMPANYCAM_PORT}   [profile: integrations]"
+  printf "    %-30s %s\n" "encircle-integration"  ":${ENCIRCLE_PORT}   [profile: integrations]"
+  printf "    %-30s %s\n" "google-integration"    ":${GOOGLE_PORT}   [profile: integrations]"
+  printf "    %-30s %s\n" "outlook-integration"   ":${OUTLOOK_PORT}   [profile: integrations]"
+  printf "    %-30s %s\n" "verisk-integration"    ":${VERISK_PORT}   [profile: integrations]"
+  printf "    %-30s %s\n" "erp-integration"       ":${ERP_PORT}   [profile: integrations]"
+  printf "    %-30s %s\n" "netsuite-integration"  ":${NETSUITE_PORT}   [profile: integrations]"
+  printf "    %-30s %s\n" "site-provisioner"      ":${SITE_PROVISIONER_PORT}   [profile: integrations]"
+  echo ""
+  echo "  Infrastructure (shared, started with './stack infra up'):"
+  printf "    %-30s %s\n" "sql-server"            "localhost:1433  (sa / LocalDev#2024!)  [shared]"
+  echo ""
+  echo "  Per-slot infrastructure:"
+  printf "    %-30s %s\n" "rabbitmq-amqp"         ":${RABBITMQ_AMQP_PORT}"
+  printf "    %-30s %s\n" "rabbitmq-mgmt-ui"      "http://localhost:${RABBITMQ_MGMT_PORT}"
+}
+
+resolve_profiles() {
+  # Expand 'all' into every profile; pass others through unchanged
+  local flags=""
+  for p in "$@"; do
+    if [[ "$p" == "all" ]]; then
+      for ap in "${ALL_PROFILES[@]}"; do
+        flags="$flags --profile $ap"
+      done
+    else
+      flags="$flags --profile $p"
+    fi
+  done
+  echo "$flags"
+}
+
+compose_cmd() {
+  docker compose \
+    --project-name "${STACK_NAME}" \
+    -f "${STACK_ROOT}/docker/docker-compose.yml" \
+    -f "${STACK_ROOT}/docker/docker-compose.local.yml" \
+    "$@"
+}
+
+infra_compose_cmd() {
+  docker compose \
+    --project-name "xcel-infra" \
+    -f "${STACK_ROOT}/infra/docker-compose.infra.yml" \
+    "$@"
+}
+
+# ─── commands ─────────────────────────────────────────────────────────────────
+
+[[ -z "$CMD" ]] && usage
+
+case "$CMD" in
+  infra)
+    SUBCMD="${2:-up}"
+    # infra commands need WORKSPACE and DB_SRC_DIR — load from slot-a as defaults
+    if [[ -f "${STACK_ROOT}/envs/slot-a.env" ]]; then
+      set -a; source "${STACK_ROOT}/envs/slot-a.env"; set +a
+    fi
+    export STACK_ROOT
+    # Check for --custom flag in remaining args
+    CUSTOM_PROFILE=""
+    for arg in "${@:3}"; do
+      [[ "$arg" == "--custom" ]] && CUSTOM_PROFILE="--profile custom"
+    done
+    case "$SUBCMD" in
+      up)
+        echo "Starting shared SQL Server infrastructure..."
+        [[ -n "$CUSTOM_PROFILE" ]] && echo "  (--custom: will also run seed-demo.sql)"
+        # shellcheck disable=SC2086
+        infra_compose_cmd $CUSTOM_PROFILE up -d
+        echo ""
+        echo "SQL Server: localhost:1433  (sa / LocalDev#2024!)"
+        echo "Run './stack infra reset' to wipe and re-seed from scratch."
+        ;;
+      down)
+        echo "Stopping shared infrastructure (data preserved)..."
+        infra_compose_cmd down
+        ;;
+      reset)
+        echo "WARNING: This will wipe XcelerateDB and re-run all migrations + seed."
+        [[ -n "$CUSTOM_PROFILE" ]] && echo "  (--custom: seed-demo.sql will also run)"
+        read -r -p "Continue? [y/N] " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+        infra_compose_cmd down -v
+        echo "Starting fresh..."
+        # shellcheck disable=SC2086
+        infra_compose_cmd $CUSTOM_PROFILE up -d
+        echo "Done. Wait ~60s for SQL Server to start, then migrations will run."
+        ;;
+      *)
+        echo "Usage: ./stack infra [up|down|reset] [--custom]"
+        exit 1
+        ;;
+    esac
+    ;;
+
+  ls)
+    list_slots
+    ;;
+
+  ports)
+    SLOT_NAME="${2:?Usage: ./stack ports <slot>}"
+    load_slot "$SLOT_NAME"
+    print_ports
+    ;;
+
+  ps)
+    if [[ -n "${2:-}" ]]; then
+      load_slot "$2"
+      compose_cmd ps
+    else
+      docker ps --filter "name=xcel-" \
+        --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || true
+    fi
+    ;;
+
+  up)
+    SLOT_NAME="${2:?Usage: ./stack up <slot> [profile...]}"
+    load_slot "$SLOT_NAME"
+    shift 2
+    PROFILES=("$@")
+
+    if [[ ${#PROFILES[@]} -eq 0 ]]; then
+      echo "Usage: ./stack up <slot> <profile...>"
+      echo ""
+      echo "Profiles: contractor  corporate  xipp  qbo  forms  integrations  all"
+      echo ""
+      echo "Examples:"
+      echo "  ./stack up ${SLOT_NAME} contractor"
+      echo "  ./stack up ${SLOT_NAME} contractor corporate"
+      echo "  ./stack up ${SLOT_NAME} all"
+      exit 1
+    fi
+
+    PROFILE_FLAGS=$(resolve_profiles "${PROFILES[@]}")
+
+    echo "Starting '${STACK_NAME}' with profiles: ${PROFILES[*]}"
+    # shellcheck disable=SC2086
+    compose_cmd $PROFILE_FLAGS up --build -d
+    echo ""
+    echo "Running services:"
+    compose_cmd ps --format "table {{.Service}}\t{{.Status}}" 2>/dev/null || true
+    echo ""
+    echo "Run './stack ports ${SLOT_NAME}' to see all URL/port assignments."
+    ;;
+
+  down)
+    SLOT_NAME="${2:?Usage: ./stack down <slot>}"
+    load_slot "$SLOT_NAME"
+    compose_cmd down
+    ;;
+
+  logs)
+    SLOT_NAME="${2:?Usage: ./stack logs <slot> [service]}"
+    load_slot "$SLOT_NAME"
+    SVC="${3:-}"
+    compose_cmd logs -f $SVC
+    ;;
+
+  build)
+    SLOT_NAME="${2:?Usage: ./stack build <slot> [service]}"
+    load_slot "$SLOT_NAME"
+    SVC="${3:-}"
+    if [[ -z "$SVC" ]]; then
+      echo "Specify a service to build, e.g.:"
+      echo "  ./stack build ${SLOT_NAME} contractor-frontend"
+      echo "  ./stack build ${SLOT_NAME} contractor-backend"
+      exit 1
+    fi
+    compose_cmd build "$SVC"
+    ;;
+
+  seed)
+    # Usage: ./stack seed <slot> [--custom]
+    # Always runs Level 1 (template) + Level 2 (customer).
+    # With --custom, also runs Level 3 (business data).
+    # Uses a temporary mssql-tools container (Azure SQL Edge has no sqlcmd binary).
+    SLOT_NAME="${2:?Usage: ./stack seed <slot> [--custom]}"
+    load_slot "$SLOT_NAME"
+    CUSTOM_SEED=""
+    for arg in "${@:3}"; do
+      [[ "$arg" == "--custom" ]] && CUSTOM_SEED="yes"
+    done
+
+    _sqlcmd() {
+      docker run --rm --network xcel-infra-net \
+        -v "${STACK_ROOT}/scripts:/scripts:ro" \
+        mcr.microsoft.com/mssql-tools \
+        /opt/mssql-tools/bin/sqlcmd -S sqlserver -U sa -P "LocalDev#2024!" "$@"
+    }
+
+    echo "Seeding shared database (XcelerateDB)..."
+    echo "  [1/2] seed-template.sql — provisioning defaults (roles, divisions, job types)..."
+    _sqlcmd -i /scripts/seed-template.sql -b
+    echo "  [2/2] seed-identity.sql — customer identity (company, user, location, permissions)..."
+    _sqlcmd -i /scripts/seed-identity.sql -b
+
+    if [[ -n "$CUSTOM_SEED" ]]; then
+      echo "  [3/3] seed-demo.sql — business data (contacts, jobs, opportunities)..."
+      _sqlcmd -i /scripts/seed-demo.sql -b
+    fi
+
+    echo ""
+    echo "Done. Login at http://localhost:${CF_PORT} with admin / admin123"
+    ;;
+
+  *)
+    usage
+    ;;
+esac

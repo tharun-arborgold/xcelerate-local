@@ -1,0 +1,94 @@
+# Dockerfile.flyway — one-shot migration init container
+# Build context: ~/repo/xcelerate/  (workspace root)
+# DB_SRC_DIR points at the database-versioning repo clone
+
+ARG DB_SRC_DIR=xcelerate-database-versioning
+
+FROM flyway/flyway:10-alpine
+
+USER root
+
+ARG DB_SRC_DIR
+COPY ${DB_SRC_DIR}/flyway/migrations/ /flyway/migrations/
+COPY ${DB_SRC_DIR}/flyway/configs/    /flyway/configs/
+
+# Flyway entrypoint — inlined so no extra build context dir needed
+RUN cat > /flyway/entrypoint.sh << 'ENTRYEOF'
+#!/bin/bash
+set -e
+
+FLYWAY_URL="jdbc:sqlserver://sqlserver:1433;databaseName=XcelerateDB;encrypt=false;trustServerCertificate=true"
+FLYWAY_USER="sa"
+FLYWAY_PASS="LocalDev#2024!"
+
+BASE_FLAGS="-url=${FLYWAY_URL} -user=${FLYWAY_USER} -password=${FLYWAY_PASS} -outOfOrder=true -validateOnMigrate=false -connectRetries=10 -connectRetriesInterval=5"
+
+echo "======================================================"
+echo "  Xcelerate Flyway Migration — Local Docker Stack"
+echo "======================================================"
+
+echo "=== Phase 1: Common Baseline ==="
+flyway $BASE_FLAGS \
+    -schemas=common -defaultSchema=common \
+    -table=flyway_schema_history_common \
+    -locations=filesystem:/flyway/migrations/common/baseline \
+    -placeholders.schemaName=common migrate
+echo "[OK] Phase 1 complete"
+
+echo "=== Phase 2: Tenant Baseline ==="
+for i in 1 2 3; do
+    flyway $BASE_FLAGS \
+        -schemas="tenant${i}" -defaultSchema="tenant${i}" \
+        -table="flyway_schema_history_tenant${i}" \
+        -locations=filesystem:/flyway/migrations/tenants/baseline \
+        -placeholders.tenantSchema="tenant${i}" \
+        -placeholders.tenantId="tenant${i}" \
+        -placeholders.commonSchema=common migrate
+done
+echo "[OK] Phase 2 complete"
+
+echo "=== Phase 3: Tenant Specific ==="
+TENANT_SPECIFIC_BASE=/flyway/migrations/tenants/tenant-specific
+for i in 1 2 3; do
+    DIR="${TENANT_SPECIFIC_BASE}/tenant${i}"
+    if [ -d "$DIR" ] && ls "$DIR"/*.sql 2>/dev/null | grep -q .; then
+        flyway $BASE_FLAGS \
+            -schemas="tenant${i}" -defaultSchema="tenant${i}" \
+            -table="flyway_schema_history_tenant${i}" \
+            -locations="filesystem:${DIR}" \
+            -placeholders.tenantSchema="tenant${i}" \
+            -placeholders.tenantId="tenant${i}" \
+            -placeholders.commonSchema=common migrate
+    fi
+done
+echo "[OK] Phase 3 complete"
+
+echo "=== Phase 4: Common Post ==="
+if [ -d /flyway/migrations/common/post ]; then
+    flyway $BASE_FLAGS \
+        -schemas=common -defaultSchema=common \
+        -table=flyway_schema_history_common \
+        -locations=filesystem:/flyway/migrations/common/post \
+        -placeholders.schemaName=common migrate
+fi
+echo "[OK] Phase 4 complete"
+
+echo "=== Phase 5: DBO Schema ==="
+if [ "${1}" == "--skip-dbo" ]; then
+    echo "[SKIP] --skip-dbo flag passed"
+else
+    flyway $BASE_FLAGS \
+        -schemas=dbo -defaultSchema=dbo \
+        -table=flyway_schema_history_dbo \
+        -locations=filesystem:/flyway/migrations/dbo \
+        -placeholders.dboSchema=dbo \
+        -mixed=true migrate
+fi
+
+echo "======================================================"
+echo "  All Flyway phases complete."
+echo "======================================================"
+ENTRYEOF
+
+RUN chmod +x /flyway/entrypoint.sh
+ENTRYPOINT ["/flyway/entrypoint.sh"]

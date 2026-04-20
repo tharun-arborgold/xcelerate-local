@@ -1,0 +1,36 @@
+# Dockerfile.xipp-frontend (React/Vite + Node)
+# Build context: ~/repo/xcelerate/  (workspace root)
+
+ARG SRC_DIR=xcelerate-ipp-frontend-v1
+
+# ============================================
+# Stage 1: Build
+# ============================================
+FROM node:20-alpine AS builder
+
+ARG SRC_DIR
+WORKDIR /app
+
+COPY ${SRC_DIR}/package.json ${SRC_DIR}/package-lock.json ${SRC_DIR}/.npmrc ./
+RUN npm ci
+
+COPY ${SRC_DIR}/ .
+RUN npm run build
+
+# ============================================
+# Stage 2: Serve
+# ============================================
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY ${SRC_DIR}/package.json ${SRC_DIR}/package-lock.json ${SRC_DIR}/.npmrc ./
+RUN npm ci --omit=dev
+
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/server.js ./
+
+EXPOSE 3000
+ENV PORT=3000
+
+CMD ["node", "server.js"]

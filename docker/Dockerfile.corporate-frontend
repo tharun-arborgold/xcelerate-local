@@ -1,0 +1,78 @@
+# Dockerfile.corporate-frontend (Angular 8, Node)
+# Build context: ~/repo/xcelerate/  (workspace root)
+
+ARG SRC_DIR=xcelerate-corporate-frontend
+ARG BUILD_CONFIG=production
+
+# ============================================
+# Stage 1: Build
+# ============================================
+FROM node:12-alpine AS builder
+
+ARG SRC_DIR
+ARG BUILD_CONFIG
+ENV BUILD_CONFIG=${BUILD_CONFIG}
+
+WORKDIR /app
+
+RUN apk add --no-cache python3 make g++
+ENV NODE_OPTIONS=--max-old-space-size=4096
+
+COPY ${SRC_DIR}/package.json ${SRC_DIR}/package-lock.json ./
+RUN npm ci --legacy-peer-deps
+
+COPY ${SRC_DIR}/ .
+
+RUN npx ng build --configuration=${BUILD_CONFIG} --output-path=dist/corporate-web 2>/dev/null || \
+    npx ng build --prod --output-path=dist/corporate-web
+
+# ============================================
+# Stage 2: Serve with nginx
+# ============================================
+FROM nginx:1.25-alpine
+
+COPY --from=builder /app/dist/corporate-web /usr/share/nginx/html
+
+RUN cat > /etc/nginx/conf.d/default.conf << 'EOF'
+server {
+    listen 80;
+    server_name localhost;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Proxy API calls to corporate-backend (internal Docker network)
+    location /xcelerate/ {
+        proxy_pass         http://corporate-backend:8087/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+    }
+
+    location ~* \.(js|css)$ {
+        expires -1;
+        add_header Cache-Control "no-cache";
+    }
+
+    location ~* \.(png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+        expires 7d;
+        add_header Cache-Control "public";
+    }
+}
+EOF
+
+EXPOSE 80
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD wget -qO- http://localhost/ || exit 1
+
+CMD ["nginx", "-g", "daemon off;"]

@@ -1,0 +1,235 @@
+# docker-compose.local.yml — per-slot overrides for local dev
+#
+# SQL Server lives in the shared infra (./stack infra up) — NOT here.
+# Backends reach it at sqlserver:1433 via xcel-infra-net.
+#
+# Start infra first:  ./stack infra up
+# Then start a slot:  ./stack up slot-a contractor
+
+networks:
+  # Shared network — SQL Server lives here (started by ./stack infra up)
+  xcel-infra-net:
+    external: true
+    name: xcel-infra-net
+
+services:
+  rabbitmq:
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+
+  contractor-backend:
+    networks:
+      - default
+      - xcel-infra-net
+    environment:
+      APP_ENV: local
+      SPRING_PROFILES_ACTIVE: dev1
+      SPRING_DATASOURCE_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=XcelerateDB;encrypt=false;trustServerCertificate=true"
+      SPRING_DATASOURCE_USERNAME: sa
+      SPRING_DATASOURCE_PASSWORD: "LocalDev#2024!"
+      EUREKA_CLIENT_ENABLED: "false"
+      SPRING_CLOUD_DISCOVERY_ENABLED: "false"
+      HIKARI_MAXIMUM_POOL_SIZE: "10"
+      HIKARI_MINIMUM_IDLE: "2"
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY: local-dummy
+      AWS_SECRET_KEY: local-dummy
+      AWS_ACCOUNT_ID: "000000000000"
+      AWS_ROLE_ARN: "arn:aws:iam::000000000000:role/local"
+      AWS_CHAT_AGENT_ID: local-dummy
+      HUBSPOT_ACCESS_TOKEN: local-dummy
+      XACTANALYSIS_CLIENT_ID: local-dummy
+      XACTANALYSIS_CLIENT_SECRET: local-dummy
+      XACTANALYSIS_SERVER_URL: "http://localhost"
+      XACTANALYSIS_EDI_URL: "http://localhost"
+      XACTANALYSIS_EDI_USERNAME: local-dummy
+      XACTANALYSIS_EDI_PASSWORD: local-dummy
+      XACTANALYSIS_USER_ID: local-dummy
+      NYLAS_API_KEY: local-dummy
+      NYLAS_CLIENT_ID: local-dummy
+      NYLAS_CLIENT_SECRET: local-dummy
+      NYLAS_ENCRYPTION_KEY: "local-dummy-encryption-key-12345"
+      NYLAS_WEBHOOK_SECRET: local-dummy
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  qbo-integration:
+    networks:
+      - default
+      - xcel-infra-net
+    environment:
+      APP_ENV: local
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=XcelerateDB;encrypt=false;trustServerCertificate=true"
+      SPRING_DATASOURCE_USERNAME: sa
+      SPRING_DATASOURCE_PASSWORD: "LocalDev#2024!"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  xipp-backend:
+    networks:
+      - default
+      - xcel-infra-net
+    environment:
+      APP_ENV: local
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=XcelerateDB;encrypt=false;trustServerCertificate=true"
+      SPRING_DATASOURCE_USERNAME: sa
+      SPRING_DATASOURCE_PASSWORD: "LocalDev#2024!"
+      JWT_SECRET: "wyqupCp1oBT3IW/ejv2azof52jaeIMvtLhTbp8/BMSoUEEI9Fsk4BUH5DuUfI8AHi62XqsSpLJyICcEGzBrecQ=="
+      CONTRACTOR_BACKEND_BASE_URL: "http://contractor-backend:8081"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  contractor-frontend:
+    build:
+      args:
+        BUILD_CONFIG: local
+
+  corporate-backend:
+    networks:
+      - default
+      - xcel-infra-net
+    environment:
+      APP_ENV: local
+      SPRING_PROFILES_ACTIVE: dev1
+      SPRING_DATASOURCE_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=XcelerateDB;encrypt=false;trustServerCertificate=true"
+      SPRING_DATASOURCE_USERNAME: sa
+      SPRING_DATASOURCE_PASSWORD: "LocalDev#2024!"
+      EUREKA_CLIENT_ENABLED: "false"
+      SPRING_CLOUD_DISCOVERY_ENABLED: "false"
+      HIKARI_MAXIMUM_POOL_SIZE: "10"
+      HIKARI_MINIMUM_IDLE: "2"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  integration-services:
+    networks:
+      - default
+      - xcel-infra-net
+    environment:
+      APP_ENV: local
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=XcelerateDB;encrypt=false;trustServerCertificate=true"
+      SPRING_DATASOURCE_USERNAME: sa
+      SPRING_DATASOURCE_PASSWORD: "LocalDev#2024!"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  companycam-integration:
+    networks:
+      - default
+      - xcel-infra-net
+    environment:
+      APP_ENV: local
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=XcelerateDB;encrypt=false;trustServerCertificate=true"
+      SPRING_DATASOURCE_USERNAME: sa
+      SPRING_DATASOURCE_PASSWORD: "LocalDev#2024!"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  encircle-integration:
+    networks:
+      - default
+      - xcel-infra-net
+    environment:
+      APP_ENV: local
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=XcelerateDB;encrypt=false;trustServerCertificate=true"
+      SPRING_DATASOURCE_USERNAME: sa
+      SPRING_DATASOURCE_PASSWORD: "LocalDev#2024!"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  google-integration:
+    networks:
+      - default
+      - xcel-infra-net
+    environment:
+      APP_ENV: local
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=XcelerateDB;encrypt=false;trustServerCertificate=true"
+      SPRING_DATASOURCE_USERNAME: sa
+      SPRING_DATASOURCE_PASSWORD: "LocalDev#2024!"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  outlook-integration:
+    networks:
+      - default
+      - xcel-infra-net
+    environment:
+      APP_ENV: local
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=XcelerateDB;encrypt=false;trustServerCertificate=true"
+      SPRING_DATASOURCE_USERNAME: sa
+      SPRING_DATASOURCE_PASSWORD: "LocalDev#2024!"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  verisk-integration:
+    networks:
+      - default
+      - xcel-infra-net
+    environment:
+      APP_ENV: local
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=XcelerateDB;encrypt=false;trustServerCertificate=true"
+      SPRING_DATASOURCE_USERNAME: sa
+      SPRING_DATASOURCE_PASSWORD: "LocalDev#2024!"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  erp-integration:
+    networks:
+      - default
+      - xcel-infra-net
+    environment:
+      APP_ENV: local
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=XcelerateDB;encrypt=false;trustServerCertificate=true"
+      SPRING_DATASOURCE_USERNAME: sa
+      SPRING_DATASOURCE_PASSWORD: "LocalDev#2024!"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  netsuite-integration:
+    networks:
+      - default
+      - xcel-infra-net
+    environment:
+      APP_ENV: local
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=XcelerateDB;encrypt=false;trustServerCertificate=true"
+      SPRING_DATASOURCE_USERNAME: sa
+      SPRING_DATASOURCE_PASSWORD: "LocalDev#2024!"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  site-provisioner:
+    networks:
+      - default
+      - xcel-infra-net
+    environment:
+      APP_ENV: local
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=XcelerateDB;encrypt=false;trustServerCertificate=true"
+      SPRING_DATASOURCE_USERNAME: sa
+      SPRING_DATASOURCE_PASSWORD: "LocalDev#2024!"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
