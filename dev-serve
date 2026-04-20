@@ -1,0 +1,495 @@
+#!/usr/bin/env bash
+# ~/xcelerate-local/dev-serve — ng serve worktree manager
+#
+# Each slot+ticket gets its own isolated directory:
+#   ~/dev/<slot>/<ticket>/corporate-frontend/   ← ng serve worktree
+#   ~/dev/<slot>/<ticket>/contractor-frontend/  ← ng serve worktree
+#   <WORKSPACE>/xcelerate-<app>-backend-<slot>/ ← Docker build worktree
+#
+# Usage:
+#   ./dev-serve serve   <slot> <ticket> <app> [branch]  Start ng serve for frontend
+#   ./dev-serve backend <slot> <ticket> <app> [branch]  Create backend worktree + rebuild Docker
+#   ./dev-serve stop    <slot> <app>                    Stop ng serve
+#   ./dev-serve rm      <slot> <ticket>                 Stop + remove all worktrees for ticket
+#   ./dev-serve ls                                      Show all worktrees + status
+#
+# Apps: corporate | contractor
+#
+# Ticket can be bare (XCEL-8929) or a branch (feature/XCEL-8929) — script normalises it.
+#
+# Examples:
+#   ./dev-serve serve   slot-a XCEL-8929 corporate
+#   ./dev-serve serve   slot-b XCEL-6474 contractor feature/XCEL-6474-modular-job-types_clean
+#   ./dev-serve backend slot-a XCEL-8929 corporate
+#   ./dev-serve backend slot-a XCEL-8929 contractor feature/XCEL-8929-some-feature
+#   ./dev-serve stop    slot-a corporate
+#   ./dev-serve rm      slot-a XCEL-8929
+#   ./dev-serve ls
+
+set -euo pipefail
+
+STACK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEV_ROOT="${HOME}/dev"
+RUN_DIR="${STACK_ROOT}/run"
+mkdir -p "$RUN_DIR"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+usage() {
+  grep '^#' "$0" | head -35 | sed 's/^# \?//'
+  exit 1
+}
+
+load_slot() {
+  local name="$1"
+  local env_file="${STACK_ROOT}/envs/${name}.env"
+  [[ ! -f "$env_file" ]] && { echo "Error: slot '$name' not found at $env_file"; exit 1; }
+  set -a; source "$env_file"; set +a
+  export STACK_ROOT
+  # Compute ports (mirrors stack script)
+  local idx=${SLOT_INDEX:-0}
+  local base=$((8080 + idx * 100))
+  export CB_PORT=$((base + 0))
+  export CORP_BACKEND_PORT=$((base + 1))
+  export CF_PORT=$((4200 + idx))
+  export CORP_FRONTEND_PORT=$((4300 + idx))
+}
+
+# Normalise ticket: "feature/XCEL-8929-some-desc" or "XCEL-8929" → "XCEL-8929"
+normalise_ticket() {
+  local input="$1"
+  # Extract XCEL-NNNN pattern
+  if [[ "$input" =~ (XCEL-[0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    # Not a standard ticket — use as-is (strip slashes for use as dirname)
+    echo "${input//\//-}"
+  fi
+}
+
+# Find the best branch for a ticket in a given repo
+find_branch() {
+  local repo_path="$1"
+  local ticket="$2"
+  local hint="${3:-}"           # optional branch name hint from user
+
+  if [[ -n "$hint" ]]; then
+    echo "$hint"
+    return
+  fi
+
+  # Search remote branches for the ticket number
+  local branch
+  branch=$(git -C "$repo_path" branch -r --list "*${ticket}*" | head -1 | sed 's|origin/||;s/^[[:space:]]*//')
+  if [[ -n "$branch" ]]; then
+    echo "$branch"
+  else
+    echo "Error: no branch found containing '${ticket}' in $(basename "$repo_path")"
+    echo "Tip: pass the branch explicitly:  ./dev-serve serve <slot> <ticket> <app> <branch>"
+    exit 1
+  fi
+}
+
+# Resolve app name → all its config
+resolve_app() {
+  local app="$1"
+  case "$app" in
+    corporate)
+      FRONTEND_REPO="xcelerate-corporate-frontend"
+      BACKEND_REPO="xcelerate-corporate-backend"
+      NG_PROJECT="xcelerate-corporate-web"
+      FRONTEND_PORT="$CORP_FRONTEND_PORT"
+      BACKEND_PORT="$CORP_BACKEND_PORT"
+      BACKEND_SRC_VAR="CORP_BACKEND_SRC_DIR"
+      BACKEND_DEFAULT_SRC="xcelerate-corporate-backend"
+      ;;
+    contractor)
+      FRONTEND_REPO="xcelerate-contractor-frontend"
+      BACKEND_REPO="xcelerate-contractor-backend"
+      NG_PROJECT="xcelerate-web"
+      FRONTEND_PORT="$CF_PORT"
+      BACKEND_PORT="$CB_PORT"
+      BACKEND_SRC_VAR="CB_SRC_DIR"
+      BACKEND_DEFAULT_SRC="xcelerate-contractor-backend"
+      ;;
+    *)
+      echo "Unknown app '${app}'. Use: corporate | contractor"
+      exit 1
+      ;;
+  esac
+}
+
+# Add 'local' build + serve configs to angular.json if missing (idempotent)
+patch_angular_json() {
+  local dir="$1"
+  local project="$2"
+  local angular_json="${dir}/angular.json"
+
+  python3 - "$angular_json" "$project" <<'PYEOF'
+import json, sys
+
+path, project = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    cfg = json.load(f)
+
+architect = cfg["projects"][project]["architect"]
+build_cfgs = architect["build"]["configurations"]
+serve_cfgs = architect["serve"]["configurations"]
+
+changed = False
+
+if "local" not in build_cfgs:
+    build_cfgs["local"] = {
+        "fileReplacements": [
+            {"replace": "src/environments/environment.ts",
+             "with":    "src/environments/environment.local.ts"}
+        ],
+        "optimization": False,
+        "outputHashing": "none",
+        "sourceMap": True,
+        "namedChunks": True,
+        "aot": True,
+        "extractLicenses": False,
+        "vendorChunk": True,
+        "buildOptimizer": False,
+        "budgets": [
+            {"type": "initial",          "maximumWarning": "2mb",  "maximumError": "20mb"},
+            {"type": "anyComponentStyle","maximumWarning": "6kb",  "maximumError": "20kb"}
+        ]
+    }
+    changed = True
+
+if "local" not in serve_cfgs:
+    serve_cfgs["local"] = {"browserTarget": f"{project}:build:local"}
+    changed = True
+
+if changed:
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    print(f"  patched angular.json: added 'local' build + serve configs")
+else:
+    print(f"  angular.json already has 'local' configs")
+PYEOF
+}
+
+# Generate proxy.conf.json so ng serve forwards /xcelerate/* to the backend
+generate_proxy() {
+  local dir="$1"
+  local backend_port="$2"
+  cat > "${dir}/proxy.conf.json" <<EOF
+{
+  "/xcelerate": {
+    "target": "http://localhost:${backend_port}",
+    "secure": false,
+    "changeOrigin": true,
+    "logLevel": "info"
+  }
+}
+EOF
+  echo "  proxy.conf.json → http://localhost:${backend_port}"
+}
+
+pid_file() { echo "${RUN_DIR}/${1}-${2}.pid"; }
+log_file() { echo "${RUN_DIR}/${1}-${2}.log"; }
+
+is_running() {
+  local pf; pf="$(pid_file "$1" "$2")"
+  [[ -f "$pf" ]] && kill -0 "$(cat "$pf")" 2>/dev/null
+}
+
+stop_serve() {
+  local slot="$1" app="$2"
+  local pf; pf="$(pid_file "$slot" "$app")"
+  if [[ -f "$pf" ]]; then
+    local pid; pid=$(cat "$pf")
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" && echo "Stopped ng serve [${slot}/${app}] (pid $pid)"
+    else
+      echo "Process $pid already gone"
+    fi
+    rm -f "$pf"
+  else
+    echo "No PID file for ${slot}/${app} — nothing to stop"
+  fi
+}
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+cmd_serve() {
+  local slot="$1"
+  local raw_ticket="$2"
+  local app="$3"
+  local branch_hint="${4:-}"
+
+  load_slot "$slot"
+  resolve_app "$app"
+
+  local ticket; ticket=$(normalise_ticket "$raw_ticket")
+  local worktree_dir="${DEV_ROOT}/${slot}/${ticket}/${app}-frontend"
+  local main_repo="${WORKSPACE}/${FRONTEND_REPO}"
+
+  echo "┌─ dev-serve: ${slot} / ${ticket} / ${app}-frontend"
+  echo "│  port    : ${FRONTEND_PORT}"
+  echo "│  backend : http://localhost:${BACKEND_PORT}"
+  echo "│  dir     : ${worktree_dir}"
+  echo "└──────────────────────────────────────────"
+
+  # Ensure the slot/ticket directory exists
+  mkdir -p "${DEV_ROOT}/${slot}/${ticket}"
+
+  # Create worktree if it doesn't exist
+  if [[ ! -d "$worktree_dir" ]]; then
+    git -C "$main_repo" fetch --quiet
+    local branch; branch=$(find_branch "$main_repo" "$ticket" "$branch_hint")
+    echo "Creating worktree: ${worktree_dir} → ${branch}"
+    git -C "$main_repo" worktree add "$worktree_dir" "$branch"
+  else
+    echo "Worktree exists: ${worktree_dir}"
+  fi
+
+  # Symlink node_modules from main repo (fast — avoids npm ci per worktree)
+  if [[ ! -e "${worktree_dir}/node_modules" ]]; then
+    echo "Symlinking node_modules from ${main_repo}"
+    ln -s "${main_repo}/node_modules" "${worktree_dir}/node_modules"
+  fi
+
+  # Copy environment.local.ts if not already present
+  if [[ ! -f "${worktree_dir}/src/environments/environment.local.ts" ]]; then
+    local main_env="${main_repo}/src/environments/environment.local.ts"
+    if [[ -f "$main_env" ]]; then
+      cp "$main_env" "${worktree_dir}/src/environments/environment.local.ts"
+      echo "  copied environment.local.ts from main repo"
+    else
+      echo "  WARNING: no environment.local.ts in main repo — create one in ${worktree_dir}/src/environments/"
+    fi
+  fi
+
+  # Patch angular.json to add 'local' build/serve configs if missing
+  patch_angular_json "$worktree_dir" "$NG_PROJECT"
+
+  # Write proxy config
+  generate_proxy "$worktree_dir" "$BACKEND_PORT"
+
+  # Stop any existing ng serve on this slot/app
+  if is_running "$slot" "$app"; then
+    echo "Stopping existing ng serve for ${slot}/${app}..."
+    stop_serve "$slot" "$app"
+  fi
+
+  # Start ng serve in background
+  local log; log=$(log_file "$slot" "$app")
+  echo "Starting ng serve on :${FRONTEND_PORT} → log: ${log}"
+  (
+    cd "$worktree_dir"
+    npx ng serve \
+      --configuration=local \
+      --proxy-config proxy.conf.json \
+      --port "$FRONTEND_PORT" \
+      --host 0.0.0.0 \
+      --disable-host-check \
+      > "$log" 2>&1
+  ) &
+  local pid=$!
+  echo "$pid" > "$(pid_file "$slot" "$app")"
+  echo ""
+  echo "Started [pid $pid]  http://localhost:${FRONTEND_PORT}"
+  echo "Logs: tail -f ${log}"
+}
+
+cmd_backend() {
+  local slot="$1"
+  local raw_ticket="$2"
+  local app="$3"
+  local branch_hint="${4:-}"
+
+  load_slot "$slot"
+  resolve_app "$app"
+
+  local ticket; ticket=$(normalise_ticket "$raw_ticket")
+  local worktree_name="${BACKEND_REPO}-${slot}"
+  local worktree_dir="${WORKSPACE}/${worktree_name}"
+  local main_repo="${WORKSPACE}/${BACKEND_REPO}"
+  local env_file="${STACK_ROOT}/envs/${slot}.env"
+
+  echo "┌─ dev-serve backend: ${slot} / ${ticket} / ${app}-backend"
+  echo "│  worktree: ${worktree_dir}"
+  echo "│  src var : ${BACKEND_SRC_VAR}=${worktree_name}"
+  echo "└──────────────────────────────────────────"
+
+  # Create worktree if it doesn't exist
+  if [[ ! -d "$worktree_dir" ]]; then
+    git -C "$main_repo" fetch --quiet
+    local branch; branch=$(find_branch "$main_repo" "$ticket" "$branch_hint")
+    echo "Creating backend worktree: ${worktree_dir} → ${branch}"
+    git -C "$main_repo" worktree add "$worktree_dir" "$branch"
+  else
+    echo "Backend worktree exists: ${worktree_dir}"
+    echo "To switch branches: git -C ${worktree_dir} switch <branch>"
+  fi
+
+  # Update slot env file to point to this worktree
+  if grep -q "^${BACKEND_SRC_VAR}=" "$env_file"; then
+    sed -i.bak "s|^${BACKEND_SRC_VAR}=.*|${BACKEND_SRC_VAR}=${worktree_name}|" "$env_file"
+    rm -f "${env_file}.bak"
+  else
+    echo "${BACKEND_SRC_VAR}=${worktree_name}" >> "$env_file"
+  fi
+  echo "Updated ${slot}.env: ${BACKEND_SRC_VAR}=${worktree_name}"
+
+  # Rebuild Docker image
+  echo ""
+  echo "Rebuilding ${app}-backend Docker image..."
+  "${STACK_ROOT}/stack" build "$slot" "${app}-backend"
+
+  echo ""
+  echo "Done. Restart the backend to apply:"
+  echo "  ./stack up ${slot} ${app}"
+}
+
+cmd_stop() {
+  local slot="$1"
+  local app="$2"
+  stop_serve "$slot" "$app"
+}
+
+cmd_rm() {
+  local slot="$1"
+  local raw_ticket="$2"
+  local ticket; ticket=$(normalise_ticket "$raw_ticket")
+  local ticket_dir="${DEV_ROOT}/${slot}/${ticket}"
+
+  if [[ ! -d "$ticket_dir" ]]; then
+    echo "Nothing found at ${ticket_dir}"
+    exit 0
+  fi
+
+  # Stop any running serves for this ticket's frontends
+  for app in corporate contractor; do
+    if is_running "$slot" "$app"; then
+      echo "Stopping ng serve for ${slot}/${app}..."
+      stop_serve "$slot" "$app"
+    fi
+  done
+
+  # Remove frontend worktrees
+  for frontend_dir in "${ticket_dir}"/*-frontend/; do
+    [[ -d "$frontend_dir" ]] || continue
+    local repo_name; repo_name=$(basename "$frontend_dir" | sed 's/-frontend$//')
+    local main_repo="${WORKSPACE}/xcelerate-${repo_name}-frontend"
+    echo "Removing frontend worktree: ${frontend_dir}"
+    git -C "$main_repo" worktree remove --force "$frontend_dir" 2>/dev/null || true
+  done
+
+  # Remove the ticket directory
+  rm -rf "$ticket_dir"
+  echo "Removed ${ticket_dir}"
+
+  # Optionally clean up backend worktrees
+  for app in corporate contractor; do
+    resolve_app "$app" 2>/dev/null || continue
+    local wt_name="${BACKEND_REPO}-${slot}"
+    local wt_dir="${WORKSPACE}/${wt_name}"
+    if [[ -d "$wt_dir" ]]; then
+      echo ""
+      echo "Backend worktree still exists: ${wt_dir}"
+      echo "To remove:  git -C ${WORKSPACE}/${BACKEND_REPO} worktree remove ${wt_dir}"
+      echo "Then reset: sed -i 's/${wt_name}/${BACKEND_DEFAULT_SRC}/' ${STACK_ROOT}/envs/${slot}.env"
+    fi
+  done 2>/dev/null || true
+}
+
+cmd_ls() {
+  echo "Active dev-serve worktrees"
+  echo "═══════════════════════════════════════════"
+
+  local found=0
+  for slot_dir in "${DEV_ROOT}"/slot-*/; do
+    [[ -d "$slot_dir" ]] || continue
+    local slot; slot=$(basename "$slot_dir")
+
+    # Load slot to get ports
+    if [[ -f "${STACK_ROOT}/envs/${slot}.env" ]]; then
+      load_slot "$slot" 2>/dev/null || true
+    fi
+
+    for ticket_dir in "${slot_dir}"*/; do
+      [[ -d "$ticket_dir" ]] || continue
+      local ticket; ticket=$(basename "$ticket_dir")
+      echo ""
+      echo "  ${slot} / ${ticket}"
+
+      for wt_dir in "${ticket_dir}"*/; do
+        [[ -d "$wt_dir" ]] || continue
+        local label; label=$(basename "$wt_dir")
+        local branch="?"
+        branch=$(git -C "$wt_dir" branch --show-current 2>/dev/null || echo "detached")
+
+        # Determine app and port
+        local app="" port=""
+        case "$label" in
+          corporate-frontend) app="corporate"; port="${CORP_FRONTEND_PORT:-4300}" ;;
+          contractor-frontend) app="contractor"; port="${CF_PORT:-4200}" ;;
+        esac
+
+        local status="stopped"
+        if [[ -n "$app" ]] && is_running "$slot" "$app"; then
+          status="running :${port}"
+        fi
+
+        printf "    %-26s  branch: %-45s  [%s]\n" "$label" "$branch" "$status"
+      done
+
+      # Check backend worktrees in WORKSPACE
+      for app in corporate contractor; do
+        resolve_app "$app" 2>/dev/null || continue
+        local wt_dir="${WORKSPACE}/${BACKEND_REPO}-${slot}"
+        if [[ -d "$wt_dir" ]]; then
+          local branch; branch=$(git -C "$wt_dir" branch --show-current 2>/dev/null || echo "detached")
+          printf "    %-26s  branch: %-45s  [docker]\n" "${app}-backend (workspace)" "$branch"
+        fi
+      done 2>/dev/null || true
+
+      found=1
+    done
+  done
+
+  if [[ $found -eq 0 ]]; then
+    echo ""
+    echo "  No worktrees found under ${DEV_ROOT}"
+    echo ""
+    echo "  Start one with:"
+    echo "    ./dev-serve serve slot-a XCEL-8929 corporate"
+  fi
+  echo ""
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+CMD="${1:-}"
+[[ -z "$CMD" ]] && usage
+
+case "$CMD" in
+  serve)
+    [[ $# -lt 4 ]] && { echo "Usage: ./dev-serve serve <slot> <ticket> <app> [branch]"; exit 1; }
+    cmd_serve "$2" "$3" "$4" "${5:-}"
+    ;;
+  backend)
+    [[ $# -lt 4 ]] && { echo "Usage: ./dev-serve backend <slot> <ticket> <app> [branch]"; exit 1; }
+    cmd_backend "$2" "$3" "$4" "${5:-}"
+    ;;
+  stop)
+    [[ $# -lt 3 ]] && { echo "Usage: ./dev-serve stop <slot> <app>"; exit 1; }
+    cmd_stop "$2" "$3"
+    ;;
+  rm)
+    [[ $# -lt 3 ]] && { echo "Usage: ./dev-serve rm <slot> <ticket>"; exit 1; }
+    cmd_rm "$2" "$3"
+    ;;
+  ls)
+    cmd_ls
+    ;;
+  *)
+    usage
+    ;;
+esac
