@@ -195,6 +195,10 @@ services:
       SPRING_RABBITMQ_PORT: 5672
       SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
       SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      BLOB_STORAGE_NAME: ${BLOB_STORAGE_NAME:-local-placeholder}
+      BLOB_STORAGE_KEY: ${BLOB_STORAGE_KEY:-local-placeholder}
+      BLOB_STORAGE_CONTAINER: ${BLOB_STORAGE_CONTAINER:-local-placeholder}
+      BLOB_STORAGE_ENDPOINT: ${BLOB_STORAGE_ENDPOINT:-http://localhost}
       JAVA_OPTS: "-Xmx512m -Xms256m"
     depends_on:
       rabbitmq:
