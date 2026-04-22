@@ -510,6 +510,68 @@ services:
     restart: unless-stopped
 
   # ─────────────────────────────────────────
+  # zappier-integration  (Spring Boot 1.x / Java 8)
+  # ─────────────────────────────────────────
+  zappier-integration:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.java8-service
+      target: runtime
+      args:
+        SRC_DIR: ${ZAPPIER_SRC_DIR:-xcelerate-zappier-integration}
+        EXPOSE_PORT: "8020"
+    image: xcelerate/zappier-integration:${STACK_NAME:-local}
+    profiles: ["integrations"]
+    ports:
+      - "${ZAPPIER_PORT}:8020"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${ZAPPIER_SPRING_PROFILE:-dev}
+      SPRING_DATASOURCE_URL: ${CB_DB_URL:-}
+      SPRING_DATASOURCE_USERNAME: ${CB_DB_USER:-}
+      SPRING_DATASOURCE_PASSWORD: ${CB_DB_PASS:-}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx256m -Xms128m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # swagger-integration  (Spring Boot 3 / Java 21)
+  # ─────────────────────────────────────────
+  swagger-integration:
+    build:
+      context: ${WORKSPACE}
+      dockerfile: ${STACK_ROOT}/docker/Dockerfile.java21-service
+      target: runtime
+      args:
+        SRC_DIR: ${SWAGGER_SRC_DIR:-xcelerate-swagger-integration}
+        EXPOSE_PORT: "8008"
+    image: xcelerate/swagger-integration:${STACK_NAME:-local}
+    profiles: ["integrations"]
+    ports:
+      - "${SWAGGER_PORT}:8008"
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      SPRING_PROFILES_ACTIVE: ${SWAGGER_SPRING_PROFILE:-dev}
+      SPRING_DATASOURCE_URL: ${CB_DB_URL:-}
+      SPRING_DATASOURCE_USERNAME: ${CB_DB_USER:-}
+      SPRING_DATASOURCE_PASSWORD: ${CB_DB_PASS:-}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASS:-guest}
+      JAVA_OPTS: "-Xmx256m -Xms128m"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
   # forms  (Angular 13 + nginx)
   # ─────────────────────────────────────────
   forms:

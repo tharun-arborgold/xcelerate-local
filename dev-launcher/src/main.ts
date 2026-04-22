@@ -1,5 +1,7 @@
-import { app, BrowserWindow, ipcMain, shell, IpcMainInvokeEvent } from 'electron'
+import { app, BrowserWindow, ipcMain, shell, IpcMainInvokeEvent, nativeImage, Menu } from 'electron'
 import { exec, spawn, execSync }  from 'child_process'
+import * as http  from 'http'
+import * as https from 'https'
 import * as path from 'path'
 import * as fs   from 'fs'
 import * as os   from 'os'
@@ -16,14 +18,19 @@ const ENV: NodeJS.ProcessEnv = {
   PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH ?? ''}`,
 }
 
+// ─── App identity ─────────────────────────────────────────────────────────────
+
+app.name = 'Xcelerate Dev'
+const ICON = nativeImage.createFromPath(path.join(__dirname, '..', 'assets', 'icon.png'))
+
 // ─── Window ──────────────────────────────────────────────────────────────────
 
 function createWindow(): void {
   const win = new BrowserWindow({
-    width:  860,
-    height: 700,
-    minWidth:  760,
-    minHeight: 560,
+    width:  1280,
+    height: 800,
+    minWidth:  900,
+    minHeight: 600,
     titleBarStyle: 'hiddenInset',
     backgroundColor: '#0d0d1a',
     webPreferences: {
@@ -32,7 +39,8 @@ function createWindow(): void {
       nodeIntegration:  false,
     },
   })
-  win.loadFile(path.join(__dirname, '..', 'index.html'))
+  win.maximize()
+  win.loadFile(path.join(__dirname, '..', 'dist', 'renderer', 'index.html'))
 }
 
 // ─── Hot-reload (dev only) ────────────────────────────────────────────────────
@@ -61,6 +69,26 @@ app.on('second-instance', () => {
 // ─── Ready ───────────────────────────────────────────────────────────────────
 
 app.whenReady().then(() => {
+  if (process.platform === 'darwin') app.dock.setIcon(ICON)
+
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    {
+      label: 'Xcelerate Dev',
+      submenu: [
+        { role: 'about', label: 'About Xcelerate Dev' },
+        { type: 'separator' },
+        { role: 'hide' },
+        { role: 'hideOthers' },
+        { role: 'unhide' },
+        { type: 'separator' },
+        { role: 'quit', label: 'Quit Xcelerate Dev' },
+      ],
+    },
+    { role: 'editMenu' },
+    { role: 'viewMenu' },
+    { role: 'windowMenu' },
+  ]))
+
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -75,7 +103,7 @@ app.on('window-all-closed', () => {
 
 function readState(): AppState {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) as AppState }
-  catch { return { activeSlot: null } }
+  catch { return { activeSlot: null, feTargets: {} } }
 }
 
 function writeState(s: Partial<AppState>): AppState {
@@ -99,12 +127,18 @@ function sh(cmd: string, cwd = LOCAL_DIR): Promise<ShellResult> {
 function computePorts(idx: number): Ports {
   const base = 8080 + idx * 100
   return {
-    contractorBackend:  base,
-    corporateBackend:   base + 1,
-    rabbitmqAmqp:       5672  + idx,
-    rabbitmqMgmt:       15672 + idx,
-    contractorFrontend: 4200  + idx,
-    corporateFrontend:  4300  + idx,
+    contractorBackend:     base,
+    corporateBackend:      base + 1,
+    integrationServices:   base + 4,
+    companycamIntegration: base + 5,
+    encircleIntegration:   base + 6,
+    zappierIntegration:    base + 13,
+    swaggerIntegration:    base + 14,
+    rabbitmqAmqp:          5672  + idx,
+    rabbitmqMgmt:          15672 + idx,
+    contractorFrontend:    4200  + idx,
+    corporateFrontend:     4300  + idx,
+    formsFrontend:         4400  + idx,
   }
 }
 
@@ -146,6 +180,19 @@ async function getInfraStatus(): Promise<string> {
     `docker inspect --format '{{.State.Status}}' xcel-sqlserver 2>/dev/null || echo "not_found"`
   )
   return stdout.trim()
+}
+
+// ─── HTTP readiness check ─────────────────────────────────────────────────────
+
+function checkHttp(url: string): Promise<boolean> {
+  return new Promise(resolve => {
+    const mod = url.startsWith('https') ? https : http
+    try {
+      const req = mod.get(url, { timeout: 1500 }, res => { resolve(true); res.destroy() })
+      req.on('error',   () => resolve(false))
+      req.on('timeout', () => { req.destroy(); resolve(false) })
+    } catch { resolve(false) }
+  })
 }
 
 // ─── Frontend processes ───────────────────────────────────────────────────────
@@ -208,13 +255,41 @@ ipcMain.handle('url:open',   (_: IpcMainInvokeEvent, url: string) => shell.openE
 
 ipcMain.handle('status:get', async (_: IpcMainInvokeEvent, { stackName, slotIdx }: { stackName: string; slotIdx: number }): Promise<AllStatus> => {
   const ports = computePorts(slotIdx)
-  const [docker, infra] = await Promise.all([getDockerStatus(stackName), getInfraStatus()])
+  const [docker, infra,
+    cbReady, corpReady, integReady, companycamReady, encircleReady, zappierReady, swaggerReady, rmqReady,
+    cfReady, corpFeReady, formsReady,
+  ] = await Promise.all([
+    getDockerStatus(stackName),
+    getInfraStatus(),
+    checkHttp(`http://localhost:${ports.contractorBackend}/actuator/health`),
+    checkHttp(`http://localhost:${ports.corporateBackend}/actuator/health`),
+    checkHttp(`http://localhost:${ports.integrationServices}/actuator/health`),
+    checkHttp(`http://localhost:${ports.companycamIntegration}/actuator/health`),
+    checkHttp(`http://localhost:${ports.encircleIntegration}/actuator/health`),
+    checkHttp(`http://localhost:${ports.zappierIntegration}/actuator/health`),
+    checkHttp(`http://localhost:${ports.swaggerIntegration}/actuator/health`),
+    checkHttp(`http://localhost:${ports.rabbitmqMgmt}`),
+    checkHttp(`http://localhost:${ports.contractorFrontend}`),
+    checkHttp(`http://localhost:${ports.corporateFrontend}`),
+    checkHttp(`http://localhost:${ports.formsFrontend}`),
+  ])
   return {
     docker,
+    dockerReady: {
+      'contractor-backend':    cbReady,
+      'corporate-backend':     corpReady,
+      'integration-services':  integReady,
+      'companycam-integration': companycamReady,
+      'encircle-integration':  encircleReady,
+      'zappier-integration':   zappierReady,
+      'swagger-integration':   swaggerReady,
+      'rabbitmq':              rmqReady,
+    },
     infra,
     frontends: {
-      'contractor-frontend': getFrontendStatus(ports.contractorFrontend),
-      'corporate-frontend':  getFrontendStatus(ports.corporateFrontend),
+      'contractor-frontend': { ...getFrontendStatus(ports.contractorFrontend), ready: cfReady },
+      'corporate-frontend':  { ...getFrontendStatus(ports.corporateFrontend),  ready: corpFeReady },
+      'forms':               { ...getFrontendStatus(ports.formsFrontend),       ready: formsReady },
     },
   }
 })
@@ -228,8 +303,16 @@ ipcMain.handle('stack:down', (_: IpcMainInvokeEvent, { slotName }: { slotName: s
 ipcMain.handle('infra:up',   () => sh('./stack infra up'))
 ipcMain.handle('infra:down', () => sh('./stack infra down'))
 
+ipcMain.handle('docker:start', (_: IpcMainInvokeEvent, { stackName, service }: { stackName: string; service: string }) =>
+  sh(`docker start ${stackName}-${service}-1`)
+)
+
 ipcMain.handle('docker:restart', (_: IpcMainInvokeEvent, { stackName, service }: { stackName: string; service: string }) =>
   sh(`docker restart ${stackName}-${service}-1`)
+)
+
+ipcMain.handle('docker:stop', (_: IpcMainInvokeEvent, { stackName, service }: { stackName: string; service: string }) =>
+  sh(`docker stop ${stackName}-${service}-1`)
 )
 
 ipcMain.handle('docker:logs', async (_: IpcMainInvokeEvent, { stackName, service, lines = 80 }: { stackName: string; service: string; lines?: number }): Promise<string> => {
@@ -237,33 +320,57 @@ ipcMain.handle('docker:logs', async (_: IpcMainInvokeEvent, { stackName, service
   return stdout || stderr || '(no output)'
 })
 
-ipcMain.handle('frontend:start', (_: IpcMainInvokeEvent, { name, slotIdx }: { name: string; slotIdx: number }): StartFrontendResult => {
+ipcMain.handle('frontend:start', (_: IpcMainInvokeEvent, { name, slotIdx, targetUrl, isRemote, envLabel }: { name: string; slotIdx: number; targetUrl: string; isRemote: boolean; envLabel: string }): StartFrontendResult => {
   ensureRunDir()
 
   const frontendDirs: Record<string, string> = {
     'contractor-frontend': path.join(WORKSPACE, 'xcelerate-contractor-frontend'),
     'corporate-frontend':  path.join(WORKSPACE, 'xcelerate-corporate-frontend'),
+    'forms':               path.join(WORKSPACE, 'xcelerate-forms'),
   }
   const dir = frontendDirs[name]
   if (!dir || !fs.existsSync(dir)) return { error: `Not found: ${dir}` }
 
   killFrontend(name)   // kill any existing process
 
-  const ports     = computePorts(slotIdx)
-  const backPort  = name === 'contractor-frontend' ? ports.contractorBackend  : ports.corporateBackend
-  const servPort  = name === 'contractor-frontend' ? ports.contractorFrontend : ports.corporateFrontend
+  const ports    = computePorts(slotIdx)
+  const servPort = name === 'contractor-frontend' ? ports.contractorFrontend
+    : name === 'corporate-frontend'              ? ports.corporateFrontend
+    :                                              ports.formsFrontend
 
-  // Write proxy.conf.json with the correct backend port for this slot
-  const proxyConfig = {
-    '/xcelerate': {
-      target:      `http://localhost:${backPort}`,
-      secure:      false,
-      changeOrigin: true,
-      pathRewrite: { '^/xcelerate': '' },
-      logLevel:    'info',
-    },
+  // Write proxy.conf.json — local slots strip /xcelerate prefix; remote envs keep it
+  const proxyEntry = isRemote
+    ? { target: targetUrl, secure: true,  changeOrigin: true, logLevel: 'info' }
+    : { target: targetUrl, secure: false, changeOrigin: true, pathRewrite: { '^/xcelerate': '' }, logLevel: 'info' }
+
+  fs.writeFileSync(path.join(dir, 'proxy.conf.json'), JSON.stringify({ '/xcelerate': proxyEntry }, null, 2))
+
+  // Rewrite environment.local.ts — replace the xceleraterestoration.com base URL
+  // so the Angular app calls the correct backend directly (env file takes precedence over proxy)
+  const envFile = path.join(dir, 'src', 'environments', 'environment.local.ts')
+  if (fs.existsSync(envFile)) {
+    const backPort  = name === 'contractor-frontend' ? ports.contractorBackend  : ports.corporateBackend
+    const frontPort = name === 'contractor-frontend' ? ports.contractorFrontend : ports.corporateFrontend
+    const newBase   = isRemote ? targetUrl.replace(/\/$/, '') : `http://localhost:${backPort}`
+    const content   = fs.readFileSync(envFile, 'utf8')
+    let updated: string
+    if (isRemote) {
+      // Remote: replace host only — /xcelerate path stays as-is
+      updated = content.replace(
+        /https?:\/\/(?:[a-z0-9-]+\.xceleraterestoration\.com|localhost:\d+)/g, newBase)
+    } else {
+      // Local: strip /xcelerate path for all API URLs (backend has no context path),
+      // then override dataUrl to frontend port — it's a tenant identifier matched against
+      // rest_comp_url in the DB (seeded as http://localhost:4200/), not the backend URL.
+      updated = content.replace(
+        /https?:\/\/(?:[a-z0-9-]+\.xceleraterestoration\.com|localhost:\d+)(?:\/xcelerate)?/g, newBase)
+      updated = updated.replace(
+        /(dataUrl:\s*['"])http:\/\/localhost:\d+(\/['"])/,
+        `$1http://localhost:${frontPort}$2`)
+    }
+    updated = updated.replace(/(prefix:\s*['"])[^'"]*(['"])/, `$1${envLabel}$2`)
+    fs.writeFileSync(envFile, updated, 'utf8')
   }
-  fs.writeFileSync(path.join(dir, 'proxy.conf.json'), JSON.stringify(proxyConfig, null, 2))
 
   const logFile = path.join(RUN_DIR, `${name}.log`)
   const pidFile = path.join(RUN_DIR, `${name}.pid`)
@@ -283,6 +390,29 @@ ipcMain.handle('frontend:start', (_: IpcMainInvokeEvent, { name, slotIdx }: { na
 ipcMain.handle('frontend:stop', (_: IpcMainInvokeEvent, { name }: { name: string }) => {
   killFrontend(name)
   return { ok: true }
+})
+
+ipcMain.handle('git:branches', async (): Promise<Record<string, string>> => {
+  const repos: Record<string, string> = {
+    'contractor-backend':    path.join(WORKSPACE, 'xcelerate-contractor-backend'),
+    'corporate-backend':     path.join(WORKSPACE, 'xcelerate-corporate-backend'),
+    'integration-services':  path.join(WORKSPACE, 'xcelerate-integration-services'),
+    'companycam-integration': path.join(WORKSPACE, 'xcelerate-companycam-integration'),
+    'encircle-integration':  path.join(WORKSPACE, 'xcelerate-encircle-integration'),
+    'zappier-integration':   path.join(WORKSPACE, 'xcelerate-zappier-integration'),
+    'swagger-integration':   path.join(WORKSPACE, 'xcelerate-swagger-integration'),
+    'contractor-frontend':   path.join(WORKSPACE, 'xcelerate-contractor-frontend'),
+    'corporate-frontend':    path.join(WORKSPACE, 'xcelerate-corporate-frontend'),
+    'forms':                 path.join(WORKSPACE, 'xcelerate-forms'),
+  }
+  const entries = await Promise.all(
+    Object.entries(repos).map(async ([name, dir]) => {
+      if (!fs.existsSync(dir)) return [name, '?'] as const
+      const { stdout } = await sh('git branch --show-current', dir)
+      return [name, stdout || 'detached'] as const
+    })
+  )
+  return Object.fromEntries(entries)
 })
 
 ipcMain.handle('frontend:logs', async (_: IpcMainInvokeEvent, { name, lines = 80 }: { name: string; lines?: number }): Promise<string> => {

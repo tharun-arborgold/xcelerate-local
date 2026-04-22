@@ -20,23 +20,59 @@ interface AppStore {
   infra:     InfraStatus
   backends:  Record<string, DockerStatus>
   frontends: Record<string, FeSvcState>
+  branches:  Record<string, string>   // service → git branch
+  feTargets: Record<string, string>   // frontend name → target key (slot name or env label)
+}
+
+// ─── Backend targets ──────────────────────────────────────────────────────────
+
+interface BackendTarget { label: string; url: string; isRemote: boolean }
+
+const REMOTE_ENVS: BackendTarget[] = [
+  { label: 'dev',   url: 'https://dev.xceleraterestoration.com',   isRemote: true },
+  { label: 'dev1',  url: 'https://dev1.xceleraterestoration.com',  isRemote: true },
+  { label: 'dev2',  url: 'https://dev2.xceleraterestoration.com',  isRemote: true },
+  { label: 'dev3',  url: 'https://dev3.xceleraterestoration.com',  isRemote: true },
+  { label: 'dev4',  url: 'https://dev4.xceleraterestoration.com',  isRemote: true },
+  { label: 'dev5',  url: 'https://dev5.xceleraterestoration.com',  isRemote: true },
+  { label: 'uat',   url: 'https://uat.xceleraterestoration.com',   isRemote: true },
+  { label: 'prod',  url: 'https://api-prod.xceleraterestoration.com', isRemote: true },
+]
+
+function allTargets(feName: string): BackendTarget[] {
+  const local: BackendTarget[] = store.slots.map(slot => {
+    const ports = slot.ports
+    const url = feName === 'contractor-frontend'
+      ? `http://localhost:${ports.contractorBackend}`
+      : `http://localhost:${ports.corporateBackend}`
+    return { label: slot.name, url, isRemote: false }
+  })
+  return [...local, ...REMOTE_ENVS]
+}
+
+function resolveTarget(feName: string): BackendTarget {
+  const key = store.feTargets[feName] ?? store.active?.name ?? ''
+  return allTargets(feName).find(t => t.label === key) ?? allTargets(feName)[0]
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
 
 type Action =
+  | { type: 'BRANCHES_UPDATED'; branches: Record<string, string> }
   | { type: 'INIT';              slots: Slot[]; activeSlotName: string | null }
   | { type: 'SELECT_SLOT';       slot: Slot }
-  | { type: 'STATUS_POLL';       docker: DockerStatusMap; infraRaw: string; frontends: Record<string, FrontendStatus> }
+  | { type: 'STATUS_POLL';       docker: DockerStatusMap; dockerReady: Record<string, boolean>; infraRaw: string; frontends: Record<string, FrontendStatus> }
   | { type: 'INFRA_START' }
   | { type: 'INFRA_STOP' }
   | { type: 'BACKENDS_START' }
   | { type: 'BACKENDS_STOP' }
   | { type: 'DOCKER_RESTART';    service: string }
+  | { type: 'DOCKER_STOP';       service: string }
   | { type: 'FRONTEND_START';    name: string }
   | { type: 'FRONTEND_STOP';     name: string }
   | { type: 'FRONTEND_RESTART';  name: string }
   | { type: 'FRONTEND_RESET';    name: string }  // force-clear a stuck transition
+  | { type: 'FE_TARGET_SET';    name: string; targetKey: string }
 
 // ─── Locked-state sets ────────────────────────────────────────────────────────
 // Services in these states are mid-transition — the poll must confirm the
@@ -48,22 +84,22 @@ const INFRA_LOCKED:  ReadonlySet<InfraStatus>  = new Set(['starting', 'stopping'
 
 // ─── Reducer ─────────────────────────────────────────────────────────────────
 
-function reconcileDocker(current: DockerStatus, polled: 'running' | 'stopped'): DockerStatus {
+function reconcileDocker(current: DockerStatus, polled: 'running' | 'stopped', ready: boolean): DockerStatus {
   if (DOCKER_LOCKED.has(current)) {
-    if (current === 'starting'   && polled === 'running')  return 'running'
-    if (current === 'stopping'   && polled === 'stopped')  return 'stopped'
-    if (current === 'restarting' && polled === 'running')  return 'running'
-    return current
+    if (current === 'starting'   && polled === 'running'  && ready) return 'running'
+    if (current === 'stopping'   && polled === 'stopped')           return 'stopped'
+    if (current === 'restarting' && polled === 'running'  && ready) return 'running'
+    return current   // stay locked until HTTP confirms ready
   }
   return polled
 }
 
 function reconcileFrontend(current: FeSvcState, polled: FrontendStatus): FeSvcState {
   if (FE_LOCKED.has(current.status)) {
-    if (current.status === 'starting'   && polled.running)  return { status: 'running', pid: polled.pid ?? undefined, port: polled.port }
-    if (current.status === 'stopping'   && !polled.running) return { status: 'stopped' }
-    if (current.status === 'restarting' && polled.running)  return { status: 'running', pid: polled.pid ?? undefined, port: polled.port }
-    return current  // stay locked
+    if (current.status === 'starting'   && polled.running && polled.ready)  return { status: 'running', pid: polled.pid ?? undefined, port: polled.port }
+    if (current.status === 'stopping'   && !polled.running)                 return { status: 'stopped' }
+    if (current.status === 'restarting' && polled.running && polled.ready)  return { status: 'running', pid: polled.pid ?? undefined, port: polled.port }
+    return current  // stay locked until HTTP confirms ready
   }
   return polled.running
     ? { status: 'running', pid: polled.pid ?? undefined, port: polled.port }
@@ -75,18 +111,19 @@ function reduce(s: AppStore, a: Action): AppStore {
 
     case 'INIT': {
       const active = a.slots.find(sl => sl.name === a.activeSlotName) ?? a.slots[0] ?? null
-      return { ...s, slots: a.slots, active }
+      const feTargets: Record<string, string> = {}
+      FRONTEND_SVCS.forEach(({ id }) => { feTargets[id] = active?.name ?? '' })
+      return { ...s, slots: a.slots, active, feTargets }
     }
 
     case 'SELECT_SLOT': {
-      // Reset to neutral so locked states (starting/stopping) never leak across slots.
-      // Pre-populate with 'unknown'/'stopped' so rows stay visible during the
-      // brief window before the next poll fills in real values (~300ms).
       const backends: Record<string, DockerStatus> = {}
       BACKEND_SVCS.forEach(({ id }) => { backends[id] = 'unknown' })
       const frontends: Record<string, FeSvcState> = {}
       FRONTEND_SVCS.forEach(({ id }) => { frontends[id] = { status: 'stopped' } })
-      return { ...s, active: a.slot, backends, frontends }
+      const feTargets: Record<string, string> = {}
+      FRONTEND_SVCS.forEach(({ id }) => { feTargets[id] = a.slot.name })
+      return { ...s, active: a.slot, backends, frontends, feTargets }
     }
 
     case 'STATUS_POLL': {
@@ -107,7 +144,7 @@ function reduce(s: AppStore, a: Action): AppStore {
       // Backends
       const backends = { ...s.backends }
       for (const [svc, p] of Object.entries(a.docker)) {
-        backends[svc] = reconcileDocker(backends[svc] ?? 'unknown', p)
+        backends[svc] = reconcileDocker(backends[svc] ?? 'unknown', p, a.dockerReady[svc] ?? false)
       }
 
       // Frontends
@@ -135,6 +172,8 @@ function reduce(s: AppStore, a: Action): AppStore {
 
     case 'DOCKER_RESTART':
       return { ...s, backends: { ...s.backends, [a.service]: 'restarting' } }
+    case 'DOCKER_STOP':
+      return { ...s, backends: { ...s.backends, [a.service]: 'stopping' } }
 
     case 'FRONTEND_START':
       return { ...s, frontends: { ...s.frontends, [a.name]: { status: 'starting' } } }
@@ -145,13 +184,19 @@ function reduce(s: AppStore, a: Action): AppStore {
     case 'FRONTEND_RESET':
       return { ...s, frontends: { ...s.frontends, [a.name]: { status: 'stopped' } } }
 
+    case 'FE_TARGET_SET':
+      return { ...s, feTargets: { ...s.feTargets, [a.name]: a.targetKey } }
+
+    case 'BRANCHES_UPDATED':
+      return { ...s, branches: a.branches }
+
     default: return s
   }
 }
 
 // ─── Store & dispatch ─────────────────────────────────────────────────────────
 
-const EMPTY: AppStore = { slots: [], active: null, infra: 'unknown', backends: {}, frontends: {} }
+const EMPTY: AppStore = { slots: [], active: null, infra: 'unknown', backends: {}, frontends: {}, branches: {}, feTargets: {} }
 let store = EMPTY
 
 function dispatch(action: Action): void {
@@ -167,7 +212,7 @@ async function poll(): Promise<void> {
   if (!store.active) return
   try {
     const st = await window.api.status.get({ stackName: store.active.stackName, slotIdx: store.active.idx })
-    dispatch({ type: 'STATUS_POLL', docker: st.docker, infraRaw: st.infra, frontends: st.frontends })
+    dispatch({ type: 'STATUS_POLL', docker: st.docker, dockerReady: st.dockerReady, infraRaw: st.infra, frontends: st.frontends })
     const el = document.getElementById('last-updated')
     if (el) el.textContent = new Date().toLocaleTimeString()
   } catch { /* ignore transient errors */ }
@@ -180,11 +225,17 @@ function startPolling(): void {
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 
+async function refreshBranches(): Promise<void> {
+  const branches = await window.api.git.branches()
+  dispatch({ type: 'BRANCHES_UPDATED', branches })
+}
+
 async function boot(): Promise<void> {
   const [slots, state] = await Promise.all([window.api.slots.list(), window.api.state.get()])
   dispatch({ type: 'INIT', slots, activeSlotName: state.activeSlot })
-  await poll()
+  await Promise.all([poll(), refreshBranches()])
   startPolling()
+  setInterval(refreshBranches, 30_000)
 }
 
 // ─── Render ───────────────────────────────────────────────────────────────────
@@ -235,9 +286,7 @@ function renderInfra(): void {
       </div>
       <div class="svc-row">
         <div class="dot ${dotCls}"></div>
-        <span class="svc-name">sql-server <span class="badge">shared</span></span>
-        <span class="svc-port">:1433</span>
-        <span class="svc-state">${label}</span>
+        <span class="svc-name">sql-server <span class="badge">shared</span><span class="port-badge">:1433</span>${statusBadge(label, dotCls === 'starting' ? 'starting' : dotCls === 'running' ? 'running' : dotCls === 'unknown' ? 'unknown' : 'stopped')}</span>
         <div class="svc-btns"></div>
       </div>
     </div>
@@ -247,9 +296,14 @@ function renderInfra(): void {
 // ── Backends ──────────────────────────────────────────────────────────────────
 
 const BACKEND_SVCS: Array<{ id: string; portKey: keyof Ports }> = [
-  { id: 'rabbitmq',           portKey: 'rabbitmqAmqp' },
-  { id: 'contractor-backend', portKey: 'contractorBackend' },
-  { id: 'corporate-backend',  portKey: 'corporateBackend' },
+  { id: 'rabbitmq',              portKey: 'rabbitmqAmqp' },
+  { id: 'contractor-backend',    portKey: 'contractorBackend' },
+  { id: 'corporate-backend',     portKey: 'corporateBackend' },
+  { id: 'integration-services',  portKey: 'integrationServices' },
+  { id: 'companycam-integration', portKey: 'companycamIntegration' },
+  { id: 'encircle-integration',   portKey: 'encircleIntegration' },
+  { id: 'zappier-integration',    portKey: 'zappierIntegration' },
+  { id: 'swagger-integration',    portKey: 'swaggerIntegration' },
 ]
 
 function renderBackends(): void {
@@ -268,16 +322,15 @@ function renderBackends(): void {
       :                               'stopped'
     const label  = busy ? st + '…' : st
 
+    const branch = store.branches[id]
     return `
       <div class="svc-row">
         <div class="dot ${dotCls}"></div>
-        <span class="svc-name">${id}</span>
-        <span class="svc-port">:${port}</span>
-        <span class="svc-state">${label}</span>
+        <span class="svc-name">${id}<span class="port-badge">:${port}</span>${statusBadge(label, busy ? 'starting' : st === 'running' ? 'running' : st === 'unknown' ? 'unknown' : 'stopped')}${branch ? `<span class="branch-badge">${branch}</span>` : ''}</span>
         <div class="svc-btns">
-          <button class="btn-icon" title="Logs"    onclick="doDockerLogs('${id}')">📋</button>
-          <button class="btn-icon" title="Restart" ${busy ? 'disabled' : ''}
-                  onclick="doDockerRestart('${id}')">${st === 'restarting' ? spinner() : '↺'}</button>
+          <button class="btn-icon" title="Logs" onclick="doDockerLogs('${id}')"><i class="ri-file-list-line"></i></button>
+          ${st === 'running' ? `<button class="btn btn-danger" onclick="doDockerStop('${id}')">Stop</button>` : ''}
+          <button class="btn btn-ghost" ${busy ? 'disabled' : ''} onclick="doDockerRestart('${id}')">${st === 'restarting' ? spinner() + ' Restarting…' : 'Restart'}</button>
         </div>
       </div>
     `
@@ -291,8 +344,9 @@ function renderBackends(): void {
           ${anyBusy
             ? `<button class="btn btn-ghost" disabled>${spinner()} Working…</button>`
             : anyRunning
-              ? `<button class="btn btn-danger" onclick="doBackendsStop()">Stop All</button>`
-              : `<button class="btn btn-primary" onclick="doBackendsStart()">Start Backends</button>`
+              ? `<button class="btn btn-danger" onclick="doBackendsStop()">Stop</button>
+                 <button class="btn btn-ghost" onclick="doBackendsRestart()">Restart</button>`
+              : `<button class="btn btn-primary" onclick="doBackendsStart()">Start</button>`
           }
         </div>
       </div>
@@ -306,6 +360,7 @@ function renderBackends(): void {
 const FRONTEND_SVCS: Array<{ id: string; portKey: keyof Ports }> = [
   { id: 'contractor-frontend', portKey: 'contractorFrontend' },
   { id: 'corporate-frontend',  portKey: 'corporateFrontend' },
+  { id: 'forms',               portKey: 'formsFrontend' },
 ]
 
 function renderFrontends(): void {
@@ -325,36 +380,61 @@ function renderFrontends(): void {
       : st === 'running'            ? 'running'
       :                               'stopped'
 
+    const targets    = allTargets(id)
+    const currentKey = store.feTargets[id] ?? store.active!.name
+    const targetSel  = `
+      <select class="target-select" ${busy ? 'disabled' : ''} onchange="setFeTarget('${id}', this.value)">
+        <optgroup label="Local">
+          ${store.slots.map(sl => `<option value="${sl.name}" ${currentKey === sl.name ? 'selected' : ''}>${sl.name}</option>`).join('')}
+        </optgroup>
+        <optgroup label="Remote">
+          ${REMOTE_ENVS.map(e => `<option value="${e.label}" ${currentKey === e.label ? 'selected' : ''}>${e.label}</option>`).join('')}
+        </optgroup>
+      </select>`
+
     let btns: string
     if (busy) {
       btns = `<button class="btn btn-ghost" disabled>${spinner()} ${cap(st)}…</button>`
     } else if (st === 'running') {
       btns = `
-        <button class="btn-icon" title="Logs"    onclick="doFrontendLogs('${id}')">📋</button>
-        <button class="btn-icon" title="Restart" onclick="doFrontendRestart('${id}')">↺</button>
-        <button class="btn btn-danger"           onclick="doFrontendStop('${id}')">Stop</button>
+        <button class="btn-icon" title="Logs" onclick="doFrontendLogs('${id}')"><i class="ri-file-list-line"></i></button>
+        <button class="btn btn-danger"         onclick="doFrontendStop('${id}')">Stop</button>
+        <button class="btn btn-ghost"          onclick="doFrontendRestart('${id}')">Restart</button>
       `
     } else {
       btns = `<button class="btn btn-primary" onclick="doFrontendStart('${id}')">Start</button>`
     }
 
+    const branch = store.branches[id]
     return `
       <div class="svc-row">
         <div class="dot ${dotCls}"></div>
-        <span class="svc-name">${id}</span>
-        <span class="svc-port">:${port}</span>
-        <span class="svc-state">${label}</span>
+        <span class="svc-name svc-link" onclick="openUrl('http://localhost:${port}')" title="Open http://localhost:${port}">${id}<i class="ri-external-link-line link-icon"></i><span class="port-badge">:${port}</span>${statusBadge(label, busy ? st : st === 'running' ? 'running' : 'stopped')}${branch ? `<span class="branch-badge">${branch}</span>` : ''}</span>
+        ${targetSel}
         <div class="svc-btns">
           ${btns}
-          <button class="btn-icon" title="Open" onclick="openUrl('http://localhost:${port}')">↗</button>
         </div>
       </div>
     `
   }).join('')
 
+  const feAnyBusy    = FRONTEND_SVCS.some(({ id }) => FE_LOCKED.has(store.frontends[id]?.status ?? 'stopped'))
+  const feAnyRunning = FRONTEND_SVCS.some(({ id }) => store.frontends[id]?.status === 'running')
+
   document.getElementById('frontend-section')!.innerHTML = `
     <div class="card">
-      <div class="card-header"><span class="card-title">Frontends (ng serve)</span></div>
+      <div class="card-header">
+        <span class="card-title">Frontends (ng serve)</span>
+        <div class="card-actions">
+          ${feAnyBusy
+            ? `<button class="btn btn-ghost" disabled>${spinner()} Working…</button>`
+            : feAnyRunning
+              ? `<button class="btn btn-danger" onclick="doFrontendsStop()">Stop</button>
+                 <button class="btn btn-ghost" onclick="doFrontendsRestart()">Restart</button>`
+              : `<button class="btn btn-primary" onclick="doFrontendsStart()">Start</button>`
+          }
+        </div>
+      </div>
       ${rows}
     </div>
   `
@@ -437,6 +517,14 @@ async function doBackendsStop(): Promise<void> {
   toast('')
 }
 
+async function doDockerStop(service: string): Promise<void> {
+  if (!store.active) return
+  dispatch({ type: 'DOCKER_STOP', service })
+  toast(`Stopping ${service}…`)
+  await window.api.docker.stop({ stackName: store.active.stackName, service })
+  toast('')
+}
+
 async function doDockerRestart(service: string): Promise<void> {
   if (!store.active) return
   dispatch({ type: 'DOCKER_RESTART', service })
@@ -445,13 +533,72 @@ async function doDockerRestart(service: string): Promise<void> {
   toast('')
 }
 
+async function doBackendsRestart(): Promise<void> {
+  if (!store.active) return
+  const running = BACKEND_SVCS.filter(({ id }) => store.backends[id] === 'running')
+  running.forEach(({ id }) => dispatch({ type: 'DOCKER_RESTART', service: id }))
+  toast(`Restarting backends…`)
+  await Promise.all(running.map(({ id }) =>
+    window.api.docker.restart({ stackName: store.active!.stackName, service: id })
+  ))
+  toast('')
+}
+
+async function doFrontendsStop(): Promise<void> {
+  toast('Stopping all frontends…')
+  await Promise.all(FRONTEND_SVCS.map(({ id }) => {
+    dispatch({ type: 'FRONTEND_STOP', name: id })
+    return window.api.frontend.stop({ name: id })
+  }))
+  toast('')
+}
+
+async function doFrontendsStart(): Promise<void> {
+  if (!store.active) return
+  toast('Starting all frontends… (~60s)')
+  FRONTEND_SVCS.forEach(({ id }) => { dispatch({ type: 'FRONTEND_START', name: id }); armFeTimeout(id) })
+  await Promise.all(FRONTEND_SVCS.map(({ id }) => {
+    const target = resolveTarget(id)
+    return window.api.frontend.start({ name: id, slotIdx: store.active!.idx, targetUrl: target.url, isRemote: target.isRemote }).then(result => {
+      if (result.error) { dispatch({ type: 'FRONTEND_RESET', name: id }); clearTimeout(feTimeouts[id]) }
+    })
+  }))
+  toast('')
+}
+
+async function doFrontendsRestart(): Promise<void> {
+  if (!store.active) return
+  toast('Restarting all frontends…')
+  const running = FRONTEND_SVCS.filter(({ id }) => store.frontends[id]?.status === 'running')
+  running.forEach(({ id }) => dispatch({ type: 'FRONTEND_RESTART', name: id }))
+  await Promise.all(running.map(async ({ id }) => {
+    const target = resolveTarget(id)
+    await window.api.frontend.stop({ name: id })
+    await delay(400)
+    await window.api.frontend.start({ name: id, slotIdx: store.active!.idx, targetUrl: target.url, isRemote: target.isRemote })
+  }))
+  toast('')
+}
+
+function setFeTarget(name: string, targetKey: string): void {
+  store = { ...store, feTargets: { ...store.feTargets, [name]: targetKey } }
+  const st = store.frontends[name]?.status
+  if (st === 'running') doFrontendRestart(name)
+}
+
 async function doFrontendStart(name: string): Promise<void> {
   if (!store.active) return
+  const target = resolveTarget(name)
   dispatch({ type: 'FRONTEND_START', name })
-  toast(`${name} compiling… (~60s)`)
+  toast(`${name} → ${target.label} — compiling… (~60s)`)
   armFeTimeout(name)
 
-  const result = await window.api.frontend.start({ name, slotIdx: store.active.idx })
+  const result = await window.api.frontend.start({
+    name,
+    slotIdx:   store.active.idx,
+    targetUrl: target.url,
+    isRemote:  target.isRemote,
+  })
   if (result.error) {
     dispatch({ type: 'FRONTEND_RESET', name })
     clearTimeout(feTimeouts[name])
@@ -468,13 +615,14 @@ async function doFrontendStop(name: string): Promise<void> {
 
 async function doFrontendRestart(name: string): Promise<void> {
   if (!store.active) return
+  const target = resolveTarget(name)
   dispatch({ type: 'FRONTEND_RESTART', name })
   toast(`${name} restarting… (compiling)`)
   armFeTimeout(name)
 
   await window.api.frontend.stop({ name })
   await delay(400)
-  const result = await window.api.frontend.start({ name, slotIdx: store.active.idx })
+  const result = await window.api.frontend.start({ name, slotIdx: store.active.idx, targetUrl: target.url, isRemote: target.isRemote })
   if (result.error) {
     dispatch({ type: 'FRONTEND_RESET', name })
     clearTimeout(feTimeouts[name])
@@ -523,7 +671,9 @@ function openLogDrawer(title: string): void {
 }
 
 function closeLogDrawer(): void {
-  document.getElementById('log-drawer')!.classList.remove('open')
+  const el = document.getElementById('log-drawer')!
+  el.classList.remove('open')
+  el.style.height = ''
   logTarget = null
   if (logTimer) { clearInterval(logTimer); logTimer = null }
 }
@@ -539,7 +689,10 @@ function toast(msg: string): void {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function spinner(): string { return '<span class="spin">⟳</span>' }
+function spinner(): string { return '<i class="ri-loader-4-line spin"></i>' }
+function statusBadge(label: string, cls: string): string {
+  return `<span class="status-badge ${cls}">${label}</span>`
+}
 function cap(s: string):    string { return s.charAt(0).toUpperCase() + s.slice(1) }
 function delay(ms: number): Promise<void> { return new Promise(r => setTimeout(r, ms)) }
 
@@ -550,7 +703,13 @@ function delay(ms: number): Promise<void> { return new Promise(r => setTimeout(r
 ;(window as any).doInfraStop        = doInfraStop
 ;(window as any).doBackendsStart    = doBackendsStart
 ;(window as any).doBackendsStop     = doBackendsStop
+;(window as any).doDockerStop       = doDockerStop
 ;(window as any).doDockerRestart    = doDockerRestart
+;(window as any).doBackendsRestart  = doBackendsRestart
+;(window as any).setFeTarget        = setFeTarget
+;(window as any).doFrontendsStart   = doFrontendsStart
+;(window as any).doFrontendsStop    = doFrontendsStop
+;(window as any).doFrontendsRestart = doFrontendsRestart
 ;(window as any).doFrontendStart    = doFrontendStart
 ;(window as any).doFrontendStop     = doFrontendStop
 ;(window as any).doFrontendRestart  = doFrontendRestart
@@ -562,5 +721,30 @@ function delay(ms: number): Promise<void> { return new Promise(r => setTimeout(r
 
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('log-close')!.addEventListener('click', closeLogDrawer)
+
+  // ── Resizable log drawer ──────────────────────────────────────────────────
+  const drawer = document.getElementById('log-drawer')!
+  const handle = document.getElementById('log-resize-handle')!
+  let startY = 0, startH = 0
+
+  handle.addEventListener('mousedown', (e: MouseEvent) => {
+    startY = e.clientY
+    startH = drawer.offsetHeight
+    drawer.classList.add('resizing')
+    e.preventDefault()
+
+    function onMove(e: MouseEvent): void {
+      const h = Math.max(80, Math.min(window.innerHeight * 0.85, startH + (startY - e.clientY)))
+      drawer.style.height = h + 'px'
+    }
+    function onUp(): void {
+      drawer.classList.remove('resizing')
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  })
+
   boot()
 })

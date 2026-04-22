@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Xcelerate Dev Launcher</title>
+  <link rel="stylesheet" href="node_modules/remixicon/fonts/remixicon.css">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -26,11 +27,12 @@
   <div class="toast" id="toast"></div>
 
   <div class="log-drawer" id="log-drawer">
+    <div class="log-resize-handle" id="log-resize-handle"></div>
     <div class="log-hdr">
       <span class="log-hdr-title" id="log-title">Logs</span>
       <div class="log-hdr-btns">
-        <button class="btn btn-ghost" style="font-size:11px;padding:2px 8px" onclick="refreshLogs()">↻</button>
-        <button class="btn-icon" id="log-close">✕</button>
+        <button class="btn btn-ghost" style="font-size:11px;padding:2px 8px" onclick="refreshLogs()"><i class="ri-refresh-line"></i></button>
+        <button class="btn-icon" id="log-close"><i class="ri-close-line"></i></button>
       </div>
     </div>
     <pre class="log-body" id="log-body"></pre>

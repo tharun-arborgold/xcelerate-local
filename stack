@@ -91,6 +91,8 @@ compute_ports() {
   export ERP_PORT=$((base + 10))
   export NETSUITE_PORT=$((base + 11))
   export SITE_PROVISIONER_PORT=$((base + 12))
+  export ZAPPIER_PORT=$((base + 13))
+  export SWAGGER_PORT=$((base + 14))
 
   export CF_PORT=$((4200 + idx))
   export CORP_FRONTEND_PORT=$((4300 + idx))
