@@ -4,9 +4,9 @@
   "description": "Local dev control panel for Xcelerate",
   "main": "dist/main.js",
   "scripts": {
-    "build": "tsc && vite build",
-    "start": "pkill -f 'electron.*dev-launcher' 2>/dev/null; npm run build && concurrently --kill-others --names tsc,vite,electron \"tsc --watch --preserveWatchOutput\" \"vite build --watch\" \"electron .\"",
-    "watch": "tsc --watch"
+    "build": "npx tsc && npx vite build",
+    "start": "pkill -f 'electron.*dev-launcher' 2>/dev/null; npm run build && concurrently --kill-others --names tsc,vite,electron \"npx tsc --watch --preserveWatchOutput\" \"npx vite build --watch\" \"electron .\"",
+    "watch": "npx tsc --watch"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
